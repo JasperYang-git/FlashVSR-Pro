@@ -112,6 +112,7 @@ class FlashVSRRealtime:
         warmup: bool = True,
         warmup_frames: int = 9,
         lq_bootstrap_windows: int = 7,
+        low_latency: bool = True,
     ):
         self.mode = mode
         self.tile_dit = tile_dit
@@ -131,6 +132,7 @@ class FlashVSRRealtime:
         self.warmup_frames = warmup_frames
         self._warmup_done = False
         self.lq_bootstrap_windows = lq_bootstrap_windows
+        self.low_latency = low_latency
 
         # dtype 映射
         if self.dtype_str == "fp16":
@@ -166,6 +168,8 @@ class FlashVSRRealtime:
         args.tile_vae = self.tile_vae
         args.tile_size = self.tile_size
         args.overlap = self.overlap
+        # Hint for infer.init_pipeline(): keep models on GPU, avoid CPU offload.
+        args.realtime_low_latency = bool(self.low_latency)
 
         # init_pipeline 内部会根据 mode 选择 VAE / TCDecoder 并加载 DiT
         self.pipe, self.vae_instance = init_pipeline(args)
@@ -735,6 +739,16 @@ def main() -> None:
         default=7,
         help="首段 LQ 特征预取窗口数（7 对应 25 帧；实时可用 2~4 降低首帧尖峰并支持 batch<25）",
     )
+    parser.add_argument(
+        "--low-latency",
+        action="store_true",
+        help="低延迟模式：禁用 CPU offload/VRAM 管理，模型常驻 GPU（推荐直播开启）",
+    )
+    parser.add_argument(
+        "--disable-low-latency",
+        action="store_true",
+        help="禁用低延迟模式（回退到省显存策略，可能增加 batch 时延）",
+    )
 
     args = parser.parse_args()
 
@@ -798,6 +812,7 @@ def main() -> None:
             warmup=not args.no_warmup,
             warmup_frames=args.warmup_frames if args.warmup_frames > 0 else args.batch_size,
             lq_bootstrap_windows=args.lq_bootstrap_windows,
+            low_latency=(not args.disable_low_latency),
         )
     except Exception as e:
         print(f"[Main] Failed to init FlashVSR: {e}")
@@ -860,3 +875,11 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
+# python livestream_infer.py \
+#   --input-rtmp rtmp://localhost:1935/live/original_stream \
+#   --output-rtmp rtmp://localhost:1935/live/sr_stream \
+#   --input-width 640 --input-height 360 --fps 10 \
+#   --mode tiny \
+#   --batch-size 17 \
+#   --bootstrap-batch-size 9 \
+#   --lq-bootstrap-windows 3

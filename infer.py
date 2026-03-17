@@ -664,10 +664,14 @@ def init_pipeline(args):
         print(f"[Warning] LQ Projector not found at {lq_path}")
     
     # Move to device and setup pipeline (combined operations)
+    # NOTE: For livestream low-latency mode we should avoid CPU offload / VRAM management,
+    # otherwise every batch may pay model move / paging costs.
+    realtime_low_latency = bool(getattr(args, "realtime_low_latency", False))
     with redirect_stdout(io.StringIO()): # Suppress
         pipe.denoising_model().LQ_proj_in = lq_proj.to(args.device, dtype=dtype)
         pipe.to(args.device)
-        pipe.enable_vram_management(num_persistent_param_in_dit=None)
+        if not realtime_low_latency:
+            pipe.enable_vram_management(num_persistent_param_in_dit=None)
         pipe.init_cross_kv()
         pipe.load_models_to_device(["dit", "vae"])
     
