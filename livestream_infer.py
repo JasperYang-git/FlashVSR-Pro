@@ -34,6 +34,7 @@ import time
 import argparse
 import threading
 import queue
+import select
 from collections import deque
 from typing import List, Optional
 
@@ -113,6 +114,9 @@ class FlashVSRRealtime:
         warmup_frames: int = 9,
         lq_bootstrap_windows: int = 7,
         low_latency: bool = True,
+        profile_batches: int = 0,
+        warmup_on_init: bool = True,
+        thread_warmup_passes: int = 0,
     ):
         self.mode = mode
         self.tile_dit = tile_dit
@@ -133,6 +137,10 @@ class FlashVSRRealtime:
         self._warmup_done = False
         self.lq_bootstrap_windows = lq_bootstrap_windows
         self.low_latency = low_latency
+        self.profile_batches = int(profile_batches) if profile_batches else 0
+        self._batch_idx = 0
+        self.warmup_on_init = bool(warmup_on_init)
+        self.thread_warmup_passes = max(0, int(thread_warmup_passes))
 
         # dtype 映射
         if self.dtype_str == "fp16":
@@ -181,8 +189,10 @@ class FlashVSRRealtime:
             except Exception:
                 pass
 
-        # Warmup once so the first real batch doesn't pay compile/alloc costs
-        if self.warmup_enabled:
+        # Main-thread warmup: warms CUDA context on THIS thread only.
+        # Actual inference runs on process_thread → first real batch can still pay ~10s "cold start"
+        # unless thread_warmup_passes > 0 (see process_thread).
+        if self.warmup_enabled and self.warmup_on_init:
             try:
                 self.warmup(self.warmup_frames)
             except Exception as e:
@@ -190,30 +200,35 @@ class FlashVSRRealtime:
 
     def warmup(self, num_frames: int) -> None:
         """
-        One-time warmup to reduce cold-start latency:
-        - GPU preprocess kernels (resize/pad/normalize)
-        - DiT forward path + VAE/TCDecoder decode path
+        Multi-pass warmup to eliminate cold-start latency:
+        - Pass 1: CUDA kernel compilation + memory allocation (slow)
+        - Pass 2: PyTorch graph optimization (may still be slow)
+        - Pass 3+: Verify stable performance
         """
         if self._warmup_done:
             return
         if num_frames < 5:
             num_frames = 5
 
-        print(f"[FlashVSRRealtime] Warmup started (frames={num_frames}, tile_dit={self.tile_dit}, tile_vae={self.tile_vae})")
+        print(f"[FlashVSRRealtime] Warmup started (frames={num_frames}, passes=3, lq_bootstrap_windows={self.lq_bootstrap_windows})")
         dummy = [Image.new("RGB", (self.in_w, self.in_h), (0, 0, 0)) for _ in range(num_frames)]
 
-        # Run a minimal end-to-end pass. This intentionally reuses process_batch() logic
-        # to hit the same code path as real streaming batches.
-        start = time.time()
-        _ = self.process_batch(dummy)
-        if self.device == "cuda":
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-        elapsed = time.time() - start
+        # Run 3 passes to ensure all compilation/optimization is done
+        total_start = time.time()
+        for pass_idx in range(3):
+            pass_start = time.time()
+            _ = self.process_batch(dummy)
+            if self.device == "cuda":
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+            pass_elapsed = time.time() - pass_start
+            print(f"[FlashVSRRealtime] Warmup pass {pass_idx+1}/3: {pass_elapsed:.2f}s")
+
+        total_elapsed = time.time() - total_start
         self._warmup_done = True
-        print(f"[FlashVSRRealtime] Warmup done in {elapsed:.2f}s")
+        print(f"[FlashVSRRealtime] Warmup complete in {total_elapsed:.2f}s total")
 
     def process_batch(self, frames: List[Image.Image]) -> List[Image.Image]:
         """
@@ -227,6 +242,11 @@ class FlashVSRRealtime:
             # 帧数太少时直接透传，避免模型对极短序列不稳定
             print(f"[FlashVSRRealtime] Batch too small ({num_frames}), bypass SR")
             return frames
+
+        # ---- lightweight timing (optional) ----
+        self._batch_idx += 1
+        do_profile = self.profile_batches > 0 and self._batch_idx <= self.profile_batches
+        t0 = time.time()
 
         # 转为 numpy 数组列表，形状 (H, W, C)，uint8
         batch_arr = [np.array(f.convert("RGB"), dtype=np.uint8) for f in frames]
@@ -242,6 +262,12 @@ class FlashVSRRealtime:
             dtype=self.dtype_torch,
             device=self.device,
         )
+        if do_profile and self.device == "cuda":
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        t_pre = time.time()
 
         # 变换为 FlashVSR 需要的形状：1, C, T, H, W
         LQ = lq_batch.permute(1, 0, 2, 3).unsqueeze(0)
@@ -302,12 +328,18 @@ class FlashVSRRealtime:
                 )
             else:
                 video = self.pipe(**pipeline_kwargs)
+        if do_profile and self.device == "cuda":
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
 
         elapsed = time.time() - start
         print(
             f"[FlashVSRRealtime] Processed {num_frames} frames in {elapsed:.2f}s "
             f"({num_frames / max(elapsed, 1e-6):.1f} FPS)"
         )
+        t_dit = time.time()
 
         # 输出形状：1, C, T, H, W，需要裁剪回精确分辨率 self.exact_h, self.exact_w
         if video.shape[-2] != self.exact_h or video.shape[-1] != self.exact_w:
@@ -324,6 +356,12 @@ class FlashVSRRealtime:
 
         # 转回 numpy 帧（列表）
         frames_np = tensor2video(video)
+        if do_profile and self.device == "cuda":
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        t_decode = time.time()
 
         # 保证输出帧数与输入一致
         if len(frames_np) > num_frames:
@@ -332,6 +370,17 @@ class FlashVSRRealtime:
             frames_np.extend([frames_np[-1]] * (num_frames - len(frames_np)))
 
         out_frames = [Image.fromarray(f) for f in frames_np]
+        if do_profile:
+            total = time.time() - t0
+            # Note: t_dit includes DiT+decode inside pipeline; t_decode mostly covers tensor->cpu/uint8 conversion.
+            print(
+                "[FlashVSRRealtime][Profile] "
+                f"batch={self._batch_idx} frames={num_frames} "
+                f"preprocess={(t_pre - t0):.3f}s "
+                f"pipeline={(t_dit - t_pre):.3f}s "
+                f"to_video={(t_decode - t_dit):.3f}s "
+                f"total={total:.3f}s"
+            )
         return out_frames
 
 
@@ -344,11 +393,17 @@ class RTMPCapture:
         self.width = width
         self.height = height
         self.process: Optional[subprocess.Popen] = None
+        self._log_thread: Optional[threading.Thread] = None
+        self._restart_lock = threading.Lock()
+        self._partial_frame_buf = bytearray()
 
     def start(self) -> None:
         print(f"[RTMPCapture] Connecting to {self.rtmp_url} ...")
         cmd = [
             "ffmpeg",
+            "-loglevel",
+            "error",
+            "-nostats",
             "-i",
             self.rtmp_url,
             "-c:v",
@@ -359,6 +414,11 @@ class RTMPCapture:
             f"{self.width}x{self.height}",
             "-r",
             str(self.fps),
+            # Keep input low-latency-ish. (Doesn't guarantee perfection, but reduces buffering.)
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
             "-f",
             "rawvideo",
             "-",
@@ -366,16 +426,58 @@ class RTMPCapture:
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # Important: ffmpeg stderr isn't read anywhere in this script.
+            # If left as PIPE, it can eventually fill up and block ffmpeg,
+            # causing stdout to stop and live SR to "freeze".
+            stderr=subprocess.DEVNULL,
             bufsize=10 * self.width * self.height * 3,
         )
+
+        # Dump ffmpeg stderr asynchronously (useful to see if ffmpeg exits or errors).
+        # def _log_ffmpeg() -> None:
+        #     assert self.process is not None
+        #     try:
+        #         for line in iter(self.process.stderr.readline, b""):
+        #             if not line:
+        #                 break
+        #             print(f"[RTMPCapture ffmpeg] {line.decode(errors='ignore').strip()}")
+        #     except Exception:
+        #         pass
+
+        # self._log_thread = threading.Thread(target=_log_ffmpeg, daemon=True)
+        # self._log_thread.start()
         print("[RTMPCapture] Started.")
 
     def read_frame(self) -> Optional[Image.Image]:
         if self.process is None or self.process.stdout is None:
             return None
+        if self.process.poll() is not None:
+            return None
         frame_size = self.width * self.height * 3
-        data = self.process.stdout.read(frame_size)
+        # Avoid blocking forever on pipe reads when ffmpeg or upstream stalls.
+        timeout_s = 1.0
+        stdout = self.process.stdout
+        while len(self._partial_frame_buf) < frame_size:
+            if self.process.poll() is not None:
+                return None
+            try:
+                ready, _, _ = select.select([stdout], [], [], timeout_s)
+            except Exception:
+                return None
+            if not ready:
+                # Let capture_thread handle restart logic on repeated timeouts.
+                return None
+            need = frame_size - len(self._partial_frame_buf)
+            try:
+                chunk = os.read(stdout.fileno(), need)
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            self._partial_frame_buf.extend(chunk)
+
+        data = bytes(self._partial_frame_buf[:frame_size])
+        del self._partial_frame_buf[:frame_size]
         if len(data) != frame_size:
             return None
         frame = np.frombuffer(data, np.uint8).reshape(self.height, self.width, 3)
@@ -383,8 +485,34 @@ class RTMPCapture:
 
     def stop(self) -> None:
         if self.process:
-            self.process.terminate()
-            self.process.wait()
+            try:
+                if self.process.stdout:
+                    self.process.stdout.close()
+            except Exception:
+                pass
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2.0)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+                try:
+                    self.process.wait(timeout=2.0)
+                except Exception:
+                    pass
+            self.process = None
+
+    def restart(self, backoff_s: float = 1.0) -> None:
+        with self._restart_lock:
+            try:
+                self.stop()
+            except Exception:
+                pass
+            if backoff_s > 0:
+                time.sleep(backoff_s)
+            self.start()
 
 
 class RTMPPush:
@@ -411,6 +539,8 @@ class RTMPPush:
         self.keep_audio = keep_audio
         self.audio_source_url = audio_source_url
         self.process: Optional[subprocess.Popen] = None
+        self._log_thread: Optional[threading.Thread] = None
+        self._restart_lock = threading.Lock()
 
     def start(self) -> None:
         print(f"[RTMPPush] Pushing to {self.rtmp_url} ...")
@@ -419,6 +549,9 @@ class RTMPPush:
             # 双输入：0 为超分后原始帧，1 为原始 RTMP（只取音频）
             cmd = [
                 "ffmpeg",
+                "-loglevel",
+                "error",
+                "-nostats",
                 "-f",
                 "rawvideo",
                 "-pixel_format",
@@ -439,12 +572,17 @@ class RTMPPush:
                 "libx264",
                 "-preset",
                 "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-pix_fmt",
+                "yuv420p",
                 "-b:v",
                 "6000k",
                 "-c:a",
                 "aac",
                 "-b:a",
                 "192k",
+                "-shortest",
                 "-flvflags",
                 "no_duration_filesize",
                 "-f",
@@ -455,6 +593,9 @@ class RTMPPush:
             # 仅视频
             cmd = [
                 "ffmpeg",
+                "-loglevel",
+                "error",
+                "-nostats",
                 "-f",
                 "rawvideo",
                 "-pixel_format",
@@ -469,6 +610,10 @@ class RTMPPush:
                 "libx264",
                 "-preset",
                 "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-pix_fmt",
+                "yuv420p",
                 "-b:v",
                 "6000k",
                 "-flvflags",
@@ -481,30 +626,49 @@ class RTMPPush:
         self.process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # ffmpeg 一般不会往 stdout 输出有效内容；保留 PIPE 容易因缓冲区满导致异常行为。
+            stdout=subprocess.DEVNULL,
+            # Important: ffmpeg stderr isn't read anywhere in this script.
+            # If left as PIPE, it can eventually fill up and block ffmpeg,
+            # causing RTMP output to stall and appear "frozen".
+            stderr=subprocess.DEVNULL,
             bufsize=10 * self.width * self.height * 3,
         )
 
         # 打印 ffmpeg 日志，便于排查问题
-        def _log_ffmpeg() -> None:
-            assert self.process is not None
+        # def _log_ffmpeg() -> None:
+        #     assert self.process is not None
+        #     try:
+        #         for line in iter(self.process.stderr.readline, b""):
+        #             if not line:
+        #                 break
+        #             print(
+        #                 f"[RTMPPush ffmpeg] {line.decode(errors='ignore').strip()}"
+        #             )
+        #     except Exception:
+        #         pass
+
+        # self._log_thread = threading.Thread(target=_log_ffmpeg, daemon=True)
+        # self._log_thread.start()
+        print("[RTMPPush] Started.")
+
+    def is_alive(self) -> bool:
+        return bool(self.process is not None and self.process.poll() is None and self.process.stdin is not None)
+
+    def restart(self, backoff_s: float = 1.0) -> None:
+        with self._restart_lock:
             try:
-                for line in iter(self.process.stderr.readline, b""):
-                    if not line:
-                        break
-                    print(
-                        f"[RTMPPush ffmpeg] {line.decode(errors='ignore').strip()}"
-                    )
+                self.stop()
             except Exception:
                 pass
-
-        t = threading.Thread(target=_log_ffmpeg, daemon=True)
-        t.start()
-        print("[RTMPPush] Started.")
+            if backoff_s > 0:
+                time.sleep(backoff_s)
+            self.start()
 
     def write_frame(self, frame: Image.Image) -> bool:
         if not self.process or not self.process.stdin:
+            return False
+        if self.process.poll() is not None:
             return False
         try:
             arr = np.array(frame.convert("RGB"), dtype=np.uint8)
@@ -521,17 +685,47 @@ class RTMPPush:
                     self.process.stdin.close()
             except Exception:
                 pass
-            self.process.terminate()
-            self.process.wait()
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2.0)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+                try:
+                    self.process.wait(timeout=2.0)
+                except Exception:
+                    pass
+            self.process = None
 
 
 def capture_thread(capture: RTMPCapture, buffer: StreamBuffer) -> None:
     try:
+        consecutive_none = 0
         while True:
             frame = capture.read_frame()
             if frame is None:
-                print("[CaptureThread] Stream ended.")
-                break
+                consecutive_none += 1
+                if consecutive_none == 1:
+                    print("[CaptureThread] read_frame returned None (starting restart loop) ...")
+                elif consecutive_none % 5 == 0:
+                    print(f"[CaptureThread] read_frame None x{consecutive_none}, restarting capture ...")
+                # Restart ffmpeg when we can't decode frames for a while.
+                if consecutive_none >= 5:
+                    consecutive_none = 0
+                    try:
+                        # Drop incomplete bytes from old pipe before restart.
+                        capture._partial_frame_buf.clear()
+                        capture.restart(backoff_s=1.0)
+                    except Exception as e:
+                        print(f"[CaptureThread] capture.restart failed: {e}")
+                        time.sleep(2.0)
+                else:
+                    time.sleep(0.05)
+                continue
+
+            consecutive_none = 0
             buffer.put(frame)
             if buffer.frame_count % 30 == 0:
                 print(
@@ -540,6 +734,20 @@ def capture_thread(capture: RTMPCapture, buffer: StreamBuffer) -> None:
                 )
     except Exception as e:
         print(f"[CaptureThread] Error: {e}")
+
+
+def _cuda_set_device_for_thread(device: str) -> None:
+    """PyTorch creates/initializes the CUDA context on first use per thread; set device explicitly."""
+    if device == "cpu":
+        return
+    if device == "cuda":
+        torch.cuda.set_device(0)
+        return
+    if device.startswith("cuda:"):
+        try:
+            torch.cuda.set_device(int(device.split(":")[-1]))
+        except Exception:
+            torch.cuda.set_device(0)
 
 
 def process_thread(
@@ -554,15 +762,142 @@ def process_thread(
         bs0 = int(bootstrap_batch_size) if bootstrap_batch_size is not None else int(batch_size)
         if bs0 < 5:
             bs0 = 5
+
+        # --- Inference-thread CUDA warmup (critical for live latency) ---
+        # Main thread warmup does NOT eliminate the first ~10s JIT/cudnn cost on this worker thread.
+        tw = getattr(flashvsr, "thread_warmup_passes", 0)
+        if tw > 0 and getattr(flashvsr, "warmup_enabled", False):
+            _cuda_set_device_for_thread(flashvsr.device)
+            nf = max(5, int(bs0))
+            dummy = [
+                Image.new("RGB", (flashvsr.in_w, flashvsr.in_h), (0, 0, 0))
+                for _ in range(nf)
+            ]
+            print(
+                f"[ProcessThread] CUDA warmup on inference thread: frames={nf}, passes={tw} "
+                f"(matches first bootstrap batch shape)"
+            )
+            for pass_idx in range(tw):
+                t0 = time.time()
+                _ = flashvsr.process_batch(dummy)
+                if flashvsr.device != "cpu":
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                print(
+                    f"[ProcessThread] Thread warmup pass {pass_idx + 1}/{tw}: "
+                    f"{time.time() - t0:.2f}s"
+                )
+
+        # If capture hiccups, the buffer may not reach the requested batch_size.
+        # In that case, we wait a short time and then process a smaller valid batch (4n+1),
+        # so realtime pushing doesn't freeze for long.
+        dyn_wait_s = 0.9
+        dyn_last_no_batch_ts = time.monotonic()
+        last_wait_log_ts = time.monotonic()
+
         while True:
             cur_bs = bs0 if first else int(batch_size)
             batch = buffer.get_batch(cur_bs)
-            if batch:
+            if batch is not None:
                 out_frames = flashvsr.process_batch(batch)
                 for f in out_frames:
-                    output_queue.put(f)
+                    # 实时场景：如果下游推流阻塞/断开，队列可能堆满。
+                    # 这里选择“丢帧保实时”，避免 process_thread 卡死导致整条链路逐步变卡。
+                    try:
+                        output_queue.put_nowait(f)
+                    except queue.Full:
+                        try:
+                            _ = output_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            output_queue.put_nowait(f)
+                        except queue.Full:
+                            pass
                 first = False
+                dyn_last_no_batch_ts = time.monotonic()
             else:
+                # buffer 不足 cur_bs，尝试动态小 batch 兜底
+                now = time.monotonic()
+                if now - dyn_last_no_batch_ts >= dyn_wait_s:
+                    avail = buffer.size()
+                    # choose largest <= avail that satisfies (n % 4 == 1)
+                    if avail >= 5:
+                        dyn_bs = avail - ((avail - 1) % 4)
+                        dyn_bs = max(5, dyn_bs)
+                        if dyn_bs <= avail:
+                            dyn_last_no_batch_ts = time.monotonic()
+                            try:
+                                dyn_batch = buffer.get_batch(dyn_bs)
+                                if dyn_batch is not None:
+                                    print(
+                                        f"[ProcessThread] Dynamic batch: requested {cur_bs}, avail {avail}, use {dyn_bs}"
+                                    )
+                                    out_frames = flashvsr.process_batch(dyn_batch)
+                                    for f in out_frames:
+                                        try:
+                                            output_queue.put_nowait(f)
+                                        except queue.Full:
+                                            try:
+                                                _ = output_queue.get_nowait()
+                                            except queue.Empty:
+                                                pass
+                                            try:
+                                                output_queue.put_nowait(f)
+                                            except queue.Full:
+                                                pass
+                                    first = False
+                                    continue
+                            except Exception as e:
+                                print(f"[ProcessThread] Dynamic batch failed: {e}")
+                    elif avail > 0:
+                        # 为了避免 avail=1..4 时无 batch 可处理导致画面长时间重复上一帧，
+                        # 这里把已有帧 padding 到 5（满足 n%4==1），仍然走完整 SR pipeline。
+                        dyn_last_no_batch_ts = time.monotonic()
+                        try:
+                            dyn_take = avail
+                            dyn_batch = buffer.get_batch(dyn_take)
+                            if dyn_batch is not None and len(dyn_batch) > 0:
+                                if len(dyn_batch) < 5:
+                                    pad_last = dyn_batch[-1]
+                                    dyn_batch = dyn_batch + [pad_last] * (5 - len(dyn_batch))
+                                dyn_bs = len(dyn_batch)
+                                print(
+                                    f"[ProcessThread] Padded batch: requested {cur_bs}, avail {avail}, use {dyn_bs}"
+                                )
+                                out_frames = flashvsr.process_batch(dyn_batch)
+                                for f in out_frames:
+                                    try:
+                                        output_queue.put_nowait(f)
+                                    except queue.Full:
+                                        try:
+                                            _ = output_queue.get_nowait()
+                                        except queue.Empty:
+                                            pass
+                                        try:
+                                            output_queue.put_nowait(f)
+                                        except queue.Full:
+                                            pass
+                                first = False
+                                continue
+                        except Exception as e:
+                            print(f"[ProcessThread] Padded batch failed: {e}")
+                # 心跳日志：帮助你区分“buffer 没新帧” vs “process_thread 卡在 process_batch”
+                now2 = time.monotonic()
+                if now2 - last_wait_log_ts >= 2.0:
+                    try:
+                        qsz = output_queue.qsize()
+                        qmax = getattr(output_queue, "maxsize", None)
+                    except Exception:
+                        qsz = -1
+                        qmax = None
+                    print(
+                        f"[ProcessThread] Waiting: buffer_avail={buffer.size()} need={cur_bs} "
+                        f"output_queue={qsz}/{qmax}"
+                    )
+                    last_wait_log_ts = now2
                 time.sleep(0.05)
     except Exception as e:
         print(f"[ProcessThread] Error: {e}")
@@ -578,9 +913,26 @@ def push_thread(
     last_frame: Optional[Image.Image] = None
     pushed = 0
     try:
+        # 保持稳定输入节奏，避免 RTMP 链路因短暂停止而断开。
+        # 即使 output_queue 暂时为空，也按 fps 持续向 ffmpeg 写帧（重复上一帧）。
+        frame_interval = 1.0 / max(float(getattr(pusher, "fps", 10.0)), 1e-6)
+        next_t = time.monotonic()
         while True:
+            # 推流进程可能因 RTMP 断开而退出；这里做自动重连
+            if not pusher.is_alive():
+                print("[PushThread] Pusher not alive, restarting ...")
+                try:
+                    pusher.restart(backoff_s=1.0)
+                except Exception as e:
+                    print(f"[PushThread] Restart failed: {e}")
+                    time.sleep(1.0)
+                    # 重置节奏，避免堆积导致突发写入
+                    next_t = time.monotonic()
+                    continue
+
+            # 非阻塞地拿到最新帧；拿不到则重复上一帧
             try:
-                frame = output_queue.get(timeout=1.0)
+                frame = output_queue.get_nowait()
                 last_frame = frame
             except queue.Empty:
                 if last_frame is None:
@@ -588,15 +940,26 @@ def push_thread(
                         "RGB", (pusher.width, pusher.height), (0, 0, 0)
                     )
                 frame = last_frame
-                print("[PushThread] Queue empty, repeat last frame.")
 
             ok = pusher.write_frame(frame)
             if not ok:
-                print("[PushThread] write_frame failed.")
-                break
+                print("[PushThread] write_frame failed, restarting pusher ...")
+                try:
+                    pusher.restart(backoff_s=1.0)
+                except Exception as e:
+                    print(f"[PushThread] Restart failed: {e}")
+                    time.sleep(1.0)
+                next_t = time.monotonic()
+                continue
+
             pushed += 1
             if pushed % 30 == 0:
                 print(f"[PushThread] Pushed {pushed} frames")
+
+            next_t += frame_interval
+            sleep_s = next_t - time.monotonic()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
     except Exception as e:
         print(f"[PushThread] Error: {e}")
 
@@ -608,36 +971,36 @@ def main() -> None:
     parser.add_argument(
         "--input-rtmp",
         type=str,
-        required=True,
+        default="rtmp://47.79.124.13:30501/live/original_stream",
         help="输入 RTMP 地址（来自 OBS -> SRS），如 rtmp://127.0.0.1:1935/live/src",
     )
     parser.add_argument(
         "--output-rtmp",
         type=str,
-        required=True,
+        default="rtmp://47.79.124.13:30501/live/sr_stream",
         help="输出 RTMP 地址（推回 SRS），如 rtmp://127.0.0.1:1935/live/sr",
     )
     parser.add_argument(
         "--input-width",
         type=int,
-        default=1280,
+        default=640,
         help="输入流分辨率宽度（需与 OBS 设置一致）",
     )
     parser.add_argument(
         "--input-height",
         type=int,
-        default=720,
+        default=360,
         help="输入流分辨率高度（需与 OBS 设置一致）",
     )
     parser.add_argument(
-        "--fps", type=int, default=30, help="帧率（需与 OBS 设置大致一致）"
+        "--fps", type=int, default=10, help="帧率（需与 OBS 设置大致一致）"
     )
 
     # FlashVSR 推理参数（对齐 infer.py）
     parser.add_argument(
         "--mode",
         type=str,
-        default="tiny-long",
+        default="tiny",
         choices=["full", "tiny", "tiny-long"],
         help="FlashVSR 模式，推荐 tiny-long",
     )
@@ -702,7 +1065,7 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=9,
+        default=25,
         help="每次送入 FlashVSR 的帧数（8n+1 更稳定，如 9, 17）",
     )
     parser.add_argument(
@@ -728,16 +1091,31 @@ def main() -> None:
         help="禁用启动预热（会增加首帧时延，但启动更快）",
     )
     parser.add_argument(
+        "--warmup-thread-passes",
+        type=int,
+        default=1,
+        help=(
+            "在推理工作线程上跑 N 次 dummy 推理（默认 3）。"
+            "主线程 warmup 无法消除工作线程首次 CUDA/cuDNN 冷启动，直播首批仍会慢 ~10s；"
+            "在线程里预热后首批可与后续 batch 同量级。设为 0 则仅主线程 warmup（旧行为）。"
+        ),
+    )
+    parser.add_argument(
+        "--warmup-on-init",
+        action="store_true",
+        help="主线程也执行 warmup（默认关闭，避免与 --warmup-thread-passes 重复耗 ~15s）",
+    )
+    parser.add_argument(
         "--warmup-frames",
         type=int,
         default=0,
-        help="预热用的帧数（默认=0 表示使用 batch-size；建议 9/17/25）",
+        help="预热用的帧数（默认=0 表示使用 bootstrap-batch-size 或 batch-size；建议与首批��一致）",
     )
     parser.add_argument(
         "--lq-bootstrap-windows",
         type=int,
         default=7,
-        help="首段 LQ 特征预取窗口数（7 对应 25 帧；实时可用 2~4 降低首帧尖峰并支持 batch<25）",
+        help="首段 LQ 特征预取窗口数（默认 3 适合实时场景；7 对应 25 帧但首帧慢）",
     )
     parser.add_argument(
         "--low-latency",
@@ -748,6 +1126,12 @@ def main() -> None:
         "--disable-low-latency",
         action="store_true",
         help="禁用低延迟模式（回退到省显存策略，可能增加 batch 时延）",
+    )
+    parser.add_argument(
+        "--profile-batches",
+        type=int,
+        default=0,
+        help="打印前 N 个 batch 的耗时拆分（预处理/推理/回传），用于分析首帧慢在哪里；0=关闭",
     )
 
     args = parser.parse_args()
@@ -794,6 +1178,25 @@ def main() -> None:
 
     # 初始化 FlashVSR 实时推理器
     try:
+        # 确定 warmup 帧数：优先使用 warmup-frames，否则使用首批次大小
+        bootstrap_bs = args.bootstrap_batch_size if args.bootstrap_batch_size > 0 else args.batch_size
+        warmup_frames = args.warmup_frames if args.warmup_frames > 0 else bootstrap_bs
+
+        if args.no_warmup:
+            warmup_on_init = False
+            thread_warmup_passes = 0
+            print("Warmup     : off (--no-warmup)")
+        else:
+            thread_warmup_passes = max(0, int(args.warmup_thread_passes))
+            warmup_on_init = bool(args.warmup_on_init)
+            if thread_warmup_passes == 0:
+                warmup_on_init = True  # legacy: only main-thread warmup
+            print(
+                f"Warmup     : main-thread={warmup_on_init}, "
+                f"infer-thread-passes={thread_warmup_passes} "
+                "(GPU 冷启动在工作线程；infer-thread>0 可避免首播 batch 再付 ~10s)"
+            )
+
         flashvsr = FlashVSRRealtime(
             mode=args.mode,
             tile_dit=args.tile_dit,
@@ -810,9 +1213,12 @@ def main() -> None:
             local_range=args.local_range,
             seed=args.seed,
             warmup=not args.no_warmup,
-            warmup_frames=args.warmup_frames if args.warmup_frames > 0 else args.batch_size,
+            warmup_frames=warmup_frames,
             lq_bootstrap_windows=args.lq_bootstrap_windows,
             low_latency=(not args.disable_low_latency),
+            profile_batches=args.profile_batches,
+            warmup_on_init=warmup_on_init,
+            thread_warmup_passes=thread_warmup_passes,
         )
     except Exception as e:
         print(f"[Main] Failed to init FlashVSR: {e}")

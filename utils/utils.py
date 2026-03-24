@@ -88,6 +88,7 @@ class Buffer_LQ4x_Proj(nn.Module):
         self.linear_layers = nn.ModuleList([nn.Linear(self.hidden_dim2, out_dim) for _ in range(layer_num)])
 
         self.clip_idx = 0
+        self.clear_cache()
 
     def forward(self, video):
         self.clear_cache()
@@ -187,6 +188,7 @@ class Causal_LQ4x_Proj(nn.Module):
         self.linear_layers = nn.ModuleList([nn.Linear(self.hidden_dim2, out_dim) for _ in range(layer_num)])
 
         self.clip_idx = 0
+        self.clear_cache()
 
     def forward(self, video):
         self.clear_cache()
