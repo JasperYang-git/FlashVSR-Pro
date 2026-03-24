@@ -520,7 +520,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                     inner_loop_num = max(1, min(int(lq_bootstrap_windows), int(max_windows_by_frames)))
                     for inner_idx in range(inner_loop_num):
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
-                            LQ_video[:, :, max(0, inner_idx*4-3):(inner_idx+1)*4-3, :, :]
+                            LQ_video[:, :, max(0, inner_idx * 4 - 3):(inner_idx + 1) * 4 - 3, :, :]
                         ) if LQ_video is not None else None
                         if cur is None:
                             continue
@@ -528,7 +528,9 @@ class FlashVSRTinyPipeline(BasePipeline):
                             LQ_latents = cur
                         else:
                             for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
+                                LQ_latents[layer_idx] = torch.cat(
+                                    [LQ_latents[layer_idx], cur[layer_idx]], dim=1
+                                )
                     # Keep original behavior for the default long-clip case (25 frames, 7 windows),
                     # but for reduced-window / short batches, advance LQ_cur_idx to the covered end.
                     if inner_loop_num == 7 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7:
@@ -541,7 +543,13 @@ class FlashVSRTinyPipeline(BasePipeline):
                     inner_loop_num = 2
                     for inner_idx in range(inner_loop_num):
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
-                            LQ_video[:, :, cur_process_idx*8+17+inner_idx*4:cur_process_idx*8+21+inner_idx*4, :, :]
+                            LQ_video[
+                                :,
+                                :,
+                                cur_process_idx * 8 + 17 + inner_idx * 4:cur_process_idx * 8 + 21 + inner_idx * 4,
+                                :,
+                                :,
+                            ]
                         ) if LQ_video is not None else None
                         if cur is None:
                             continue
@@ -549,9 +557,11 @@ class FlashVSRTinyPipeline(BasePipeline):
                             LQ_latents = cur
                         else:
                             for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
-                    LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
-                    cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
+                                LQ_latents[layer_idx] = torch.cat(
+                                    [LQ_latents[layer_idx], cur[layer_idx]], dim=1
+                                )
+                    LQ_cur_idx = cur_process_idx * 8 + 21 + (inner_loop_num - 2) * 4
+                    cur_latents = latents[:, :, 4 + cur_process_idx * 2:6 + cur_process_idx * 2, :, :]
 
                 # Inference (No motion_controller / vace)
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
@@ -571,7 +581,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                     cur_process_idx=cur_process_idx,
                     t_mod=self.t_mod,
                     t=self.t,
-                    local_range = local_range,
+                    local_range=local_range,
                 )
 
                 # Update latent
@@ -583,8 +593,14 @@ class FlashVSRTinyPipeline(BasePipeline):
 
             # Decode: for very short / reduced-bootstrap streams, disable cond to avoid
             # temporal/channel mismatches inside TCDecoder when latent time has been padded.
-            use_cond_for_decode = (LQ_cur_idx >= 25 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7)
-            cond_for_decode = LQ_video[:, :, :LQ_cur_idx, :, :] if (LQ_video is not None and use_cond_for_decode) else None
+            use_cond_for_decode = (
+                LQ_cur_idx >= 25 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7
+            )
+            cond_for_decode = (
+                LQ_video[:, :, :LQ_cur_idx, :, :]
+                if (LQ_video is not None and use_cond_for_decode)
+                else None
+            )
 
             if tiled:
                 frames = self._tiled_decode(
@@ -592,27 +608,43 @@ class FlashVSRTinyPipeline(BasePipeline):
                     cond=cond_for_decode,
                     tile_size=tile_size,
                     tile_stride=tile_stride,
-                    decoding_msg=decoding_msg if decoding_msg else "Decoding video (Tiled)"
+                    decoding_msg=decoding_msg if decoding_msg else "Decoding video (Tiled)",
                 )
             else:
                 frames = self.TCDecoder.decode_video(
                     latents.transpose(1, 2),
-                    parallel=False, 
-                    show_progress_bar=True, 
+                    parallel=False,
+                    show_progress_bar=True,
                     cond=cond_for_decode,
-                    decoding_msg=decoding_msg if decoding_msg else "Decoding video" # If no msg, default to "Decoding video"
+                    decoding_msg=decoding_msg if decoding_msg else "Decoding video",
                 ).transpose(1, 2).mul_(2).sub_(1)
 
             # Color correction (wavelet)
             try:
-                if color_fix:
-                    frames = self.ColorCorrector(
-                        frames.to(device=LQ_video.device),
-                        LQ_video[:, :, :frames.shape[2], :, :],
-                        clip_range=(-1, 1),
-                        chunk_size=16,
-                        method='adain'
-                    )
+                if color_fix and LQ_video is not None:
+                    # Decode may output more temporal frames than input LQ (padding / streaming);
+                    # ColorCorrector requires matching T on both tensors.
+                    t_hq = frames.shape[2]
+                    t_lq = LQ_video.shape[2]
+                    t_use = min(t_hq, t_lq)
+                    if t_use > 0:
+                        hq_cc = frames[:, :, :t_use, :, :].to(
+                            device=LQ_video.device, dtype=frames.dtype
+                        )
+                        lq_cc = LQ_video[:, :, :t_use, :, :]
+                        fixed = self.ColorCorrector(
+                            hq_cc,
+                            lq_cc,
+                            clip_range=(-1, 1),
+                            chunk_size=16,
+                            method="adain",
+                        )
+                        if t_use < t_hq:
+                            frames = torch.cat(
+                                [fixed, frames[:, :, t_use:, :, :]], dim=2
+                            )
+                        else:
+                            frames = fixed
             except Exception as e:
                 print(f"[ColorFix Error] {e}")
                 pass
