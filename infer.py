@@ -155,7 +155,17 @@ def parse_args():
         type=int,
         default=4,
         help="首段 LQ 特征预取窗口数（7 对应 25 帧；实时可用 2~4 降低首帧尖峰并支持 batch<25）",
-    )                   
+    )
+    parser.add_argument(
+        "--warmup",
+        action="store_true",
+        help="在正式推理前先跑一轮同分辨率 dry-run 预热，降低首轮 CUDA/cuDNN 冷启动尖峰",
+    )
+    parser.add_argument(
+        "--profile-timings",
+        action="store_true",
+        help="打印前处理、模型加载、warmup、LQ bootstrap、DiT、解码、保存等详细耗时",
+    )
     
     return parser.parse_args()
 
@@ -677,8 +687,249 @@ def init_pipeline(args):
     
     return pipe, vae_system_instance
 
+
+def sync_device(device):
+    """Synchronize CUDA work for accurate timing."""
+    device_str = str(device)
+    if device_str.startswith("cuda") and torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+
+def build_pipeline_kwargs(args, LQ, num_frames, height, width):
+    """Build pipeline kwargs shared by warmup and real inference."""
+    pipeline_kwargs = {
+        "prompt": "",
+        "negative_prompt": "",
+        "cfg_scale": 1.0,
+        "num_inference_steps": 1,
+        "seed": args.seed,
+        "LQ_video": LQ,
+        "num_frames": num_frames,
+        "height": height,
+        "width": width,
+        "is_full_block": False,
+        "if_buffer": True,
+        "topk_ratio": args.sparse_ratio * 768 * 1280 / (height * width),
+        "kv_ratio": args.kv_ratio,
+        "local_range": args.local_range,
+        "color_fix": args.color_fix,
+        "lq_bootstrap_windows": args.lq_bootstrap_windows,
+    }
+
+    if args.tile_vae:
+        pipeline_kwargs["tiled"] = True
+        vae_tile_size_latent = max(32, args.tile_size // 8)
+        vae_overlap_latent = max(4, args.overlap // 8)
+        pipeline_kwargs["tile_size"] = (vae_tile_size_latent, vae_tile_size_latent)
+        pipeline_kwargs["tile_stride"] = (
+            vae_tile_size_latent - vae_overlap_latent,
+            vae_tile_size_latent - vae_overlap_latent,
+        )
+        print(
+            f"VAE Tiling Enabled: tile_size (latent)={pipeline_kwargs['tile_size']}, "
+            f"stride={pipeline_kwargs['tile_stride']}"
+        )
+
+    return pipeline_kwargs
+
+
+def execute_pipeline(pipe, args, LQ, pipeline_kwargs, announce=True):
+    """Run the selected inference path without profiling wrappers."""
+    if args.tile_dit:
+        if announce:
+            print(f"Tiled DiT: tile_size={args.tile_size}, overlap={args.overlap}")
+        tile_kwargs = pipeline_kwargs.copy()
+        tile_kwargs.pop("LQ_video", None)
+        vae_tile_size_tuple = tile_kwargs.pop("tile_size", None)
+        return apply_tiled_inference_simple(
+            pipe,
+            LQ,
+            tile_size=args.tile_size,
+            overlap=args.overlap,
+            tile_size_vae=vae_tile_size_tuple,
+            **tile_kwargs,
+        )
+
+    if announce:
+        if args.mode == "tiny-long":
+            msg = "Running inference (Streaming"
+            if args.tile_vae:
+                msg += " & VAE-tiled"
+            msg += ")..."
+            print(msg)
+        else:
+            print("Running inference...")
+
+    return pipe(**pipeline_kwargs)
+
+
+def run_pipeline_with_optional_profile(pipe, args, LQ, pipeline_kwargs, announce=True):
+    """Run inference and optionally measure internal stage timings."""
+    profile_stats = {
+        "pipeline_total": 0.0,
+        "lq_stream_forward_total": 0.0,
+        "lq_stream_forward_first": 0.0,
+        "lq_stream_forward_rest": 0.0,
+        "lq_stream_forward_calls": 0,
+        "dit_model_fn_total": 0.0,
+        "dit_model_fn_calls": 0,
+        "decoder_total": 0.0,
+        "decoder_calls": 0,
+        "color_fix_total": 0.0,
+        "color_fix_calls": 0,
+    }
+
+    if not args.profile_timings:
+        sync_device(args.device)
+        t0 = time.perf_counter()
+        video = execute_pipeline(pipe, args, LQ, pipeline_kwargs, announce=announce)
+        sync_device(args.device)
+        profile_stats["pipeline_total"] = time.perf_counter() - t0
+        return video, profile_stats
+
+    lq_module = getattr(pipe.denoising_model(), "LQ_proj_in", None)
+    orig_stream_forward = getattr(lq_module, "stream_forward", None) if lq_module is not None else None
+
+    profile_module = None
+    if args.mode == "tiny":
+        import diffsynth.pipelines.flashvsr_tiny as profile_module
+    elif args.mode == "tiny-long":
+        import diffsynth.pipelines.flashvsr_tiny_long as profile_module
+    orig_model_fn = getattr(profile_module, "model_fn_wan_video", None) if profile_module is not None else None
+
+    decoder_owner = getattr(pipe, "TCDecoder", None)
+    decoder_attr = "decode_video"
+    if decoder_owner is None or not hasattr(decoder_owner, decoder_attr):
+        decoder_owner = getattr(pipe, "vae", None)
+        decoder_attr = "decode"
+    orig_decoder = getattr(decoder_owner, decoder_attr, None) if decoder_owner is not None else None
+
+    color_owner = getattr(pipe, "ColorCorrector", None)
+    orig_color_forward = getattr(color_owner, "forward", None) if color_owner is not None else None
+
+    def timed_stream_forward(*a, **kw):
+        sync_device(args.device)
+        t0 = time.perf_counter()
+        out = orig_stream_forward(*a, **kw)
+        sync_device(args.device)
+        dt = time.perf_counter() - t0
+        if profile_stats["lq_stream_forward_calls"] == 0:
+            profile_stats["lq_stream_forward_first"] += dt
+        else:
+            profile_stats["lq_stream_forward_rest"] += dt
+        profile_stats["lq_stream_forward_total"] += dt
+        profile_stats["lq_stream_forward_calls"] += 1
+        return out
+
+    def timed_model_fn(*a, **kw):
+        sync_device(args.device)
+        t0 = time.perf_counter()
+        out = orig_model_fn(*a, **kw)
+        sync_device(args.device)
+        profile_stats["dit_model_fn_total"] += time.perf_counter() - t0
+        profile_stats["dit_model_fn_calls"] += 1
+        return out
+
+    def timed_decoder(*a, **kw):
+        sync_device(args.device)
+        t0 = time.perf_counter()
+        out = orig_decoder(*a, **kw)
+        sync_device(args.device)
+        profile_stats["decoder_total"] += time.perf_counter() - t0
+        profile_stats["decoder_calls"] += 1
+        return out
+
+    def timed_color_forward(*a, **kw):
+        sync_device(args.device)
+        t0 = time.perf_counter()
+        out = orig_color_forward(*a, **kw)
+        sync_device(args.device)
+        profile_stats["color_fix_total"] += time.perf_counter() - t0
+        profile_stats["color_fix_calls"] += 1
+        return out
+
+    try:
+        if orig_stream_forward is not None:
+            lq_module.stream_forward = timed_stream_forward
+        if orig_model_fn is not None:
+            profile_module.model_fn_wan_video = timed_model_fn
+        if orig_decoder is not None:
+            setattr(decoder_owner, decoder_attr, timed_decoder)
+        if orig_color_forward is not None:
+            color_owner.forward = timed_color_forward
+
+        sync_device(args.device)
+        t0 = time.perf_counter()
+        video = execute_pipeline(pipe, args, LQ, pipeline_kwargs, announce=announce)
+        sync_device(args.device)
+        profile_stats["pipeline_total"] = time.perf_counter() - t0
+        return video, profile_stats
+    finally:
+        if orig_stream_forward is not None:
+            lq_module.stream_forward = orig_stream_forward
+        if orig_model_fn is not None:
+            profile_module.model_fn_wan_video = orig_model_fn
+        if orig_decoder is not None:
+            setattr(decoder_owner, decoder_attr, orig_decoder)
+        if orig_color_forward is not None:
+            color_owner.forward = orig_color_forward
+
+
+def build_warmup_kwargs(pipeline_kwargs):
+    """Use a representative short clip to trigger first-run kernel setup."""
+    warmup_frames = min(int(pipeline_kwargs["num_frames"]), 25)
+    warmup_kwargs = dict(pipeline_kwargs)
+    warmup_kwargs["LQ_video"] = pipeline_kwargs["LQ_video"][:, :, :warmup_frames, :, :]
+    warmup_kwargs["num_frames"] = warmup_frames
+    warmup_kwargs["color_fix"] = False
+    return warmup_kwargs
+
+
+def print_timing_breakdown(stage_timings, profile_stats=None):
+    print("\n=== Timing Breakdown ===")
+    ordered_keys = [
+        ("prepare_input", "prepare_input_tensor"),
+        ("model_init", "init_pipeline"),
+        ("warmup", "warmup"),
+        ("pipeline_total", "pipeline_total"),
+        ("crop_output", "crop_output"),
+        ("tensor_to_video", "tensor2video"),
+        ("save_video", "save_video"),
+        ("total", "total"),
+    ]
+    for key, label in ordered_keys:
+        if key in stage_timings:
+            print(f"{label:20s}: {stage_timings[key]:.3f}s")
+
+    if not profile_stats:
+        return
+
+    print("--- Pipeline Internals ---")
+    print(f"{'LQ_proj_total':20s}: {profile_stats['lq_stream_forward_total']:.3f}s")
+    print(f"{'LQ_proj_first_call':20s}: {profile_stats['lq_stream_forward_first']:.3f}s")
+    print(f"{'LQ_proj_rest_calls':20s}: {profile_stats['lq_stream_forward_rest']:.3f}s")
+    print(f"{'LQ_proj_call_count':20s}: {profile_stats['lq_stream_forward_calls']}")
+    print(f"{'DiT_model_fn':20s}: {profile_stats['dit_model_fn_total']:.3f}s")
+    print(f"{'DiT_call_count':20s}: {profile_stats['dit_model_fn_calls']}")
+    print(f"{'decoder_total':20s}: {profile_stats['decoder_total']:.3f}s")
+    print(f"{'decoder_call_count':20s}: {profile_stats['decoder_calls']}")
+    print(f"{'color_fix_total':20s}: {profile_stats['color_fix_total']:.3f}s")
+    print(f"{'color_fix_call_count':20s}: {profile_stats['color_fix_calls']}")
+    other = (
+        profile_stats["pipeline_total"]
+        - profile_stats["lq_stream_forward_total"]
+        - profile_stats["dit_model_fn_total"]
+        - profile_stats["decoder_total"]
+        - profile_stats["color_fix_total"]
+    )
+    print(f"{'pipeline_other':20s}: {other:.3f}s")
+
 def main():
-    total_start_time = time.time()
+    total_start_time = time.perf_counter()
+    stage_timings = {}
     
     # Enable TF32 for faster matrix multiplications on Ampere/Hopper GPUs (A100/H100)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -771,19 +1022,25 @@ def main():
     else:
         dtype = torch.float32
     
+    prepare_input_start = time.perf_counter()
     LQ, th, tw, F, fps, input_video_path, total_frames_orig, exact_h, exact_w = prepare_input_tensor(
         args.input, 
         scale=args.scale, 
         dtype=dtype,
         device=args.device
     )
+    sync_device(args.device)
+    stage_timings["prepare_input"] = time.perf_counter() - prepare_input_start
     
     # Override FPS if specified by user
     if args.fps is not None:
         fps = args.fps
     
     # Initialize pipeline with VAE manager
+    model_init_start = time.perf_counter()
     pipe, vae_instance = init_pipeline(args)
+    sync_device(args.device)
+    stage_timings["model_init"] = time.perf_counter() - model_init_start
     
     # Ensure LQ is on the correct device (it should be already if prepare_input_tensor kept it there)
     # This is a no-op if already on device, but safe to keep.
@@ -862,102 +1119,40 @@ def main():
     
     # print(f"Output: {output_path}")
     
-    # Prepare pipeline parameters
-    pipeline_kwargs = {
-        "prompt": "", 
-        "negative_prompt": "", 
-        "cfg_scale": 1.0, 
-        "num_inference_steps": 1, 
-        "seed": args.seed,
-        "LQ_video": LQ, 
-        "num_frames": F, 
-        "height": th, 
-        "width": tw, 
-        "is_full_block": False, 
-        "if_buffer": True,
-        "topk_ratio": args.sparse_ratio * 768 * 1280 / (th * tw), 
-        "kv_ratio": args.kv_ratio,
-        "local_range": args.local_range,
-        "color_fix": args.color_fix,
-    }
-    
-    # Add VAE tiling parameters (for full and tiny mode)
-    if args.tile_vae:
-        pipeline_kwargs["tiled"] = True
-        # Ensure we pass sensible tile_size and tile_stride for VAE
-        # args.tile_size is from CLI (default 256 for simple Tile Utils, but here for VAE it is latent size?)
-        # FlashVSRTiny default is (60, 104) ~= 480x832 pixels / 8
-        # If user provides explicit tile size, use it. Otherwise, let's pick a reasonable default or respect args.tile_size
-        
-        # NOTE: args.tile_size is typically 256. 256 * 8 = 2048 pixels. This is a very large tile for VAE.
-        # It's likely args.tile_size is meant for DiT pixel blocks in other contexts? 
-        # But 'apply_tiled_inference_simple' uses it as pixel size for DiT.
-        # For VAE here, 'tile_size' argument to __call__ expects Latent Size.
-        # If we use 256 output pixels -> 32 latent size.
-        # Let's assume if tile-dit is OFF, args.tile_size might be irrelevant or we should interpret it.
-        # If tile-dit is ON, args.tile_size is used for DiT.
-        
-        # Let's interpret args.tile_size as PIXEL size for consistency if tile-dit is ON?
-        # No, for VAE tiling, usually we want bigger chunks than DiT tiling. 
-        # Let's use a safe default if not specified, or derive from args.tile_size / 8
-        # If user didn't change default 256... 256/8 = 32. 
-        
-        # Actually, let's trust the defaults in the pipeline if user didn't specifying anything specific for VAE?
-        # But user might want to control it using CLI args.
-        # Let's pass args.tile_size // 8 if plausible.
-        
-        # Current logic: If tile-vae is ON, we want to enforce tiling.
-        # Let's update tile_size and tile_stride in pipeline_kwargs
-        
-        # Safely convert pixel tile size (args.tile_size) to latent size
-        # Assuming args.tile_size is "pixel size"
-        vae_tile_size_latent = max(32, args.tile_size // 8)
-        vae_overlap_latent = max(4, args.overlap // 8)
-        
-        pipeline_kwargs["tile_size"] = (vae_tile_size_latent, vae_tile_size_latent)
-        pipeline_kwargs["tile_stride"] = (vae_tile_size_latent - vae_overlap_latent, vae_tile_size_latent - vae_overlap_latent)
-        
-        print(f"VAE Tiling Enabled: tile_size (latent)={pipeline_kwargs['tile_size']}, stride={pipeline_kwargs['tile_stride']}")
+    pipeline_kwargs = build_pipeline_kwargs(args, LQ, F, th, tw)
+
+    if args.warmup:
+        warmup_kwargs = build_warmup_kwargs(pipeline_kwargs)
+        print(
+            f"Warmup enabled: frames={warmup_kwargs['num_frames']}, "
+            f"color_fix={warmup_kwargs['color_fix']}"
+        )
+        print("Running warmup pass...")
+        warmup_start = time.perf_counter()
+        warmup_video, _ = run_pipeline_with_optional_profile(
+            pipe,
+            args,
+            warmup_kwargs["LQ_video"],
+            warmup_kwargs,
+            announce=False,
+        )
+        sync_device(args.device)
+        stage_timings["warmup"] = time.perf_counter() - warmup_start
+        del warmup_video
+        print(f"Warmup completed in {stage_timings['warmup']:.2f} seconds")
 
     # Run inference (tiled or standard)
-    inference_start_time = time.time()
-
-    if args.tile_dit:
-        print(f"Tiled DiT: tile_size={args.tile_size}, overlap={args.overlap}")
-
-        # Create a copy of pipeline_kwargs and remove LQ_video
-        tile_kwargs = pipeline_kwargs.copy()
-        tile_kwargs.pop('LQ_video', None)  # Remove LQ_video because it's already passed as a positional argument
-
-        # Handle potential collision of 'tile_size' argument
-        # pipeline_kwargs might contain 'tile_size' (tuple) for VAE if tile-vae is on.
-        # apply_tiled_inference_simple takes 'tile_size' (int) for DiT.
-        # To avoid error, we pop 'tile_size' from kwargs and pass it as 'tile_size_vae' if present.
-        vae_tile_size_tuple = tile_kwargs.pop('tile_size', None)
-        
-        # Tiled inference
-        video = apply_tiled_inference_simple(
-            pipe,
-            LQ,
-            tile_size=args.tile_size,
-            overlap=args.overlap,
-            tile_size_vae=vae_tile_size_tuple,
-            **tile_kwargs
-        )
-    else:
-        # print("Running inference...") # Controlled inside pipeline or tqdm
-        if args.mode == 'tiny-long':
-             msg = "Running inference (Streaming"
-             if args.tile_vae:
-                 msg += " & VAE-tiled"
-             msg += ")..."
-             print(msg)
-        else:
-             print("Running inference...")
-        video = pipe(**pipeline_kwargs)
-
-    inference_end_time = time.time()
+    inference_start_time = time.perf_counter()
+    video, profile_stats = run_pipeline_with_optional_profile(
+        pipe,
+        args,
+        LQ,
+        pipeline_kwargs,
+        announce=True,
+    )
+    inference_end_time = time.perf_counter()
     inference_duration = inference_end_time - inference_start_time
+    stage_timings["pipeline_total"] = inference_duration
     print(f"Inference completed in {inference_duration:.2f} seconds")
     
     if NVENC_AVAILABLE:
@@ -968,6 +1163,7 @@ def main():
     # Convert and save video
     # Crop back to exact requested resolution sH x sW (exact_h, exact_w)
     # The Model Output `video` is (B, C, T, H, W)
+    crop_start = time.perf_counter()
     if video.shape[-2] != exact_h or video.shape[-1] != exact_w:
         # We padded center, so we crop center
         curr_h, curr_w = video.shape[-2], video.shape[-1]
@@ -978,8 +1174,12 @@ def main():
         pad_left = pad_w // 2
         
         video = video[..., pad_top:pad_top+exact_h, pad_left:pad_left+exact_w]
+    sync_device(args.device)
+    stage_timings["crop_output"] = time.perf_counter() - crop_start
 
+    tensor_to_video_start = time.perf_counter()
     frames = tensor2video(video)
+    stage_timings["tensor_to_video"] = time.perf_counter() - tensor_to_video_start
 
     # Ensure output Duration matches Input Duration (Remove padding / Fill missing)
     if len(frames) > total_frames_orig:
@@ -992,6 +1192,7 @@ def main():
     if args.keep_audio and input_video_path and is_video(input_video_path) and has_audio_stream(input_video_path):
         # Optimized: piped saving (single pass)
         print("Preserving audio (streaming mode)...")
+        save_start = time.perf_counter()
         success = save_video_with_audio_piped(frames, output_path, input_video_path, fps=fps, quality=args.quality)
         
         if not success:
@@ -1004,16 +1205,22 @@ def main():
             # Clean up temp file
             if os.path.exists(temp_output):
                 os.remove(temp_output)
+        stage_timings["save_video"] = time.perf_counter() - save_start
     else:
         # No audio to preserve: save directly to final output
+        save_start = time.perf_counter()
         save_video(frames, output_path, fps=fps, quality=args.quality)
+        stage_timings["save_video"] = time.perf_counter() - save_start
 
     print(f"Done!\nOutput: {output_path}")
 
     # Process total time
-    total_end_time = time.time()
+    total_end_time = time.perf_counter()
     total_duration = total_end_time - total_start_time
+    stage_timings["total"] = total_duration
     print(f"Total processing time: {total_duration:.2f} seconds")
+    if args.profile_timings:
+        print_timing_breakdown(stage_timings, profile_stats)
 
     # Cleanup
     vae_instance.clean_memory()
@@ -1022,3 +1229,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ffmpeg -i inputs/example4.mp4 -vf "fps=10,scale=640:360" -frames:v 25 inputs/output_25_10fps_360p.mp4
