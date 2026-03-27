@@ -832,6 +832,7 @@ def process_thread(
     batch_size: int,
     bootstrap_batch_size: Optional[int] = None,
     boot_t0: Optional[float] = None,
+    bypass_sr: bool = False,
 ) -> None:
     try:
         first = True
@@ -882,7 +883,24 @@ def process_thread(
                 )
 
             batch_t0 = time.monotonic()
-            out_frames = flashvsr.process_batch(batch)
+            if bypass_sr:
+                # 透传输入画面（缩放到与 SR 输出相同的推流分辨率），用于对比时延是否主要来自 FlashVSR。
+                try:
+                    _resample = Image.Resampling.BILINEAR
+                except AttributeError:
+                    _resample = Image.BILINEAR  # type: ignore[attr-defined]
+                tw, th = int(flashvsr.exact_w), int(flashvsr.exact_h)
+                out_frames = [
+                    np.ascontiguousarray(
+                        np.asarray(
+                            f.convert("RGB").resize((tw, th), _resample),
+                            dtype=np.uint8,
+                        )
+                    )
+                    for f in batch
+                ]
+            else:
+                out_frames = flashvsr.process_batch(batch)
             batch_elapsed = time.monotonic() - batch_t0
             if not first_real_batch_done:
                 first_real_batch_done = True
@@ -899,7 +917,11 @@ def process_thread(
         # --- Inference-thread CUDA warmup (critical for live latency) ---
         # Main thread warmup does NOT eliminate the first ~10s JIT/cudnn cost on this worker thread.
         tw = getattr(flashvsr, "thread_warmup_passes", 0)
-        if tw > 0 and getattr(flashvsr, "warmup_enabled", False):
+        if (
+            not bypass_sr
+            and tw > 0
+            and getattr(flashvsr, "warmup_enabled", False)
+        ):
             _cuda_set_device_for_thread(flashvsr.device)
             nf = max(5, int(bs0))
             dummy = [
@@ -1267,6 +1289,14 @@ def main() -> None:
         default=0,
         help="打印前 N 个 batch 的耗时拆分（预处理/推理/回传），用于分析首帧慢在哪里；0=关闭",
     )
+    parser.add_argument(
+        "--bypass-sr",
+        action="store_true",
+        help=(
+            "跳过 FlashVSR 推理：将输入帧双线性缩放到与超分相同的推流分辨率后直出，"
+            "用于对比端到端时延是否主要由模型引起（仍会加载模型；可配合 --no-warmup）"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1281,6 +1311,8 @@ def main() -> None:
         f"Scale      : {args.scale}x, tile-dit={args.tile_dit}, "
         f"tile-vae={args.tile_vae}, keep-audio={args.keep_audio}"
     )
+    if args.bypass_sr:
+        print("Bypass SR  : on（透传+缩放，不跑 process_batch；推理线程不做 CUDA warmup）")
     print("=" * 80)
 
     # 初始化缓冲与队列
@@ -1317,10 +1349,13 @@ def main() -> None:
         bootstrap_bs = args.bootstrap_batch_size if args.bootstrap_batch_size > 0 else args.batch_size
         warmup_frames = args.warmup_frames if args.warmup_frames > 0 else bootstrap_bs
 
-        if args.no_warmup:
+        if args.no_warmup or args.bypass_sr:
             warmup_on_init = False
             thread_warmup_passes = 0
-            print("Warmup     : off (--no-warmup)")
+            if args.bypass_sr:
+                print("Warmup     : off（--bypass-sr，不做主线程/推理线程模型预热）")
+            else:
+                print("Warmup     : off (--no-warmup)")
         else:
             thread_warmup_passes = max(0, int(args.warmup_thread_passes))
             warmup_on_init = bool(args.warmup_on_init)
@@ -1347,7 +1382,7 @@ def main() -> None:
             kv_ratio=args.kv_ratio,
             local_range=args.local_range,
             seed=args.seed,
-            warmup=not args.no_warmup,
+            warmup=not args.no_warmup and not args.bypass_sr,
             warmup_frames=warmup_frames,
             lq_bootstrap_windows=args.lq_bootstrap_windows,
             color_fix=args.color_fix,
@@ -1380,6 +1415,7 @@ def main() -> None:
             args.batch_size,
             args.bootstrap_batch_size if args.bootstrap_batch_size > 0 else None,
             boot_t0,
+            args.bypass_sr,
         ),
         daemon=True,
     )
