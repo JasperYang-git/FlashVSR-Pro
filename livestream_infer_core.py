@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FlashVSR-Pro 实时直播超分核心脚本。
+Core script for real-time video super-resolution using FlashVSR-Pro.
 
-仅保留核心链路：
-RTMP 拉流 -> FlashVSR 批量推理 -> RTMP 推流
+Only the core elements are retained.
+RTMP stream pulling -> FlashVSR batch inference -> RTMP stream pushing
 """
 
 import os
@@ -37,8 +37,21 @@ from infer import (  # type: ignore
 )
 
 
+LOG_LEVEL = 1
+CAPTURE_LOG_INTERVAL = 8
+PUSH_LOG_INTERVAL = 8
+EMPTY_OUT_QUEUE_WAIT_S = 0.1
 OutputFrame = Union[Image.Image, np.ndarray]
 
+
+def printlog(level, *args, **kwargs):
+    if level > LOG_LEVEL:
+        return
+    print(*args, **kwargs)
+
+
+def timestamp():
+    return time.strftime("%H:%M:%S")
 
 @dataclass
 class FramePacket:
@@ -47,7 +60,7 @@ class FramePacket:
 
 
 class StreamBuffer:
-    """简单线程安全帧缓冲。"""
+    "Simple, thread safe frame buffer"
 
     def __init__(self, max_size: int = 300):
         self.buffer = deque(maxlen=max_size)
@@ -106,9 +119,7 @@ class FlashVSRRealtime:
         kv_ratio: float = 3.0,
         local_range: int = 11,
         seed: int = 0,
-        lq_bootstrap_windows: int = 3,
         color_fix: bool = False,
-        low_latency: bool = True,
     ):
         self.mode = mode
         self.tile_dit = tile_dit
@@ -124,9 +135,7 @@ class FlashVSRRealtime:
         self.kv_ratio = kv_ratio
         self.local_range = local_range
         self.seed = seed
-        self.lq_bootstrap_windows = lq_bootstrap_windows
         self.color_fix = bool(color_fix)
-        self.low_latency = low_latency
 
         if self.dtype_str == "fp16":
             self.dtype_torch = torch.float16
@@ -137,7 +146,7 @@ class FlashVSRRealtime:
 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
 
         self.sW, self.sH, self.tW, self.tH = compute_scaled_and_target_dims(
             self.in_w, self.in_h, scale=self.scale, multiple=128
@@ -157,15 +166,9 @@ class FlashVSRRealtime:
         args.tile_vae = self.tile_vae
         args.tile_size = self.tile_size
         args.overlap = self.overlap
-        args.realtime_low_latency = bool(self.low_latency)
+        args.realtime_low_latency = True
 
         self.pipe, self.vae_instance = init_pipeline(args)
-
-        if self.device == "cuda":
-            try:
-                torch.cuda.set_per_process_memory_fraction(1.0)
-            except Exception:
-                pass
 
     def process_batch(self, frames: List[Image.Image]) -> List[OutputFrame]:
         if not frames:
@@ -203,7 +206,7 @@ class FlashVSRRealtime:
             "kv_ratio": self.kv_ratio,
             "local_range": self.local_range,
             "color_fix": self.color_fix,
-            "lq_bootstrap_windows": self.lq_bootstrap_windows,
+            "streaming": True,
         }
 
         if self.tile_vae:
@@ -255,52 +258,122 @@ class FlashVSRRealtime:
         return frames_np
 
 
-class RTMPCapture:
-    """通过 ffmpeg 拉取原始帧。"""
+class RTMPBase:
+    '''
+    Base class for RTMPCapture and RTMPPush with generic functionality.
+    Every subclass is expected to have a process and stream (stdin or stdout)
+    attribute.
+    '''
+    def __init__(self):
+        self.process = None
+        self.stream = None
+        self.name = type(self).__name__   # name of actual subclass
+        self._restart_lock = threading.Lock()
 
-    def __init__(self, rtmp_url: str, fps: int, width: int, height: int):
+    def is_alive(self) -> bool:
+        return bool(
+            self.process is not None
+            and self.process.poll() is None
+            and self.stream is not None
+        )
+
+    def stop(self) -> None:
+        if not self.process or not self.stream:
+            raise ValueError(f"[{self.name}] Unable to stop: Invalid state")
+            return
+
+        self.stream.close()
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            print(f"[{self.name}] Stop: Unable to terminante subprocess")
+            try:
+                self.process.kill()
+            except Exception as exc:
+                print(f"[{self.name}] Stop: Unable to kill subprocess:", exc)
+        self.process = None
+
+    def restart(self, backoff_s: float = 1.0) -> None:
+        with self._restart_lock:
+            self.stop()
+            if backoff_s > 0:
+                time.sleep(backoff_s)
+            self.start()
+
+
+class RTMPCapture(RTMPBase):
+    "Manages an ffmpeg subprocess to capture frames into a buffer"
+
+    def __init__(
+            self,
+            rtmp_url: str,
+            fps: int,
+            width: int,
+            height: int,
+            loop: bool,
+            add_timestamp: bool
+    ):
+        super().__init__()
         self.rtmp_url = rtmp_url
         self.fps = fps
         self.width = width
         self.height = height
-        self.process: Optional[subprocess.Popen] = None
-        self._restart_lock = threading.Lock()
         self._partial_frame_buf = bytearray()
         self._frame_seq = 0
+        self.loop_video = loop
+        self.add_timestamp = add_timestamp
 
     def start(self) -> None:
         print(f"[RTMPCapture] Connecting to {self.rtmp_url}")
         cmd = [
             "ffmpeg",
-            "-loglevel",
-            "error",
+            "-loglevel", "error",
             "-nostats",
-            "-i",
-            self.rtmp_url,
-            "-c:v",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{self.width}x{self.height}",
-            "-r",
-            str(self.fps),
-            "-f",
-            "rawvideo",
-            "-",
         ]
+        if self.loop_video:
+            cmd.extend([
+                "-stream_loop", "-1",
+            ])
+        cmd.extend([
+            "-r", str(self.fps),
+            "-re",
+            "-i", self.rtmp_url,
+            ])
+        if self.add_timestamp:
+            opt = " ".join([
+                'drawtext=fontfile=DejaVuSans-Bold.ttf:',
+                r"text='%{pts\:hms}':",
+                "x=0: y=h-(2*lh):",
+                "fontcolor=white:",
+                "fontsize=45:",
+                "box=1:",
+                'boxcolor=0x00000000@0.5'
+            ])
+            cmd.extend([
+                "-vf", opt
+            ])
+        cmd.extend([
+            "-c:v", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{self.width}x{self.height}",
+            "-framerate", str(self.fps),
+            "-f", "rawvideo",
+            "-",
+        ])
+
+        # FIXME: can we check that the pipe doesn't get full and stalls?
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=10 * self.width * self.height * 3,
         )
+        self.stream = self.process.stdout
         print("[RTMPCapture] Started")
 
     def read_frame(self) -> Optional[FramePacket]:
-        if self.process is None or self.process.stdout is None:
-            return None
-        if self.process.poll() is not None:
+        if not self.is_alive():
             return None
 
         frame_size = self.width * self.height * 3
@@ -308,65 +381,30 @@ class RTMPCapture:
 
         while len(self._partial_frame_buf) < frame_size:
             if self.process.poll() is not None:
+                print('[Read frame] Unable to read. Subprocess terminated')
                 return None
             try:
                 ready, _, _ = select.select([stdout], [], [], 1.0)
-            except Exception:
-                return None
-            if not ready:
-                return None
-            need = frame_size - len(self._partial_frame_buf)
-            try:
+                if not ready:
+                    return None
+                need = frame_size - len(self._partial_frame_buf)
                 chunk = os.read(stdout.fileno(), need)
-            except Exception:
-                return None
-            if not chunk:
+                if not chunk:
+                    return None
+            except Exception as exc:
+                print('[Read frame] Error while reading:', exc)
                 return None
             self._partial_frame_buf.extend(chunk)
-
         data = bytes(self._partial_frame_buf[:frame_size])
         del self._partial_frame_buf[:frame_size]
-        if len(data) != frame_size:
-            return None
 
         frame = np.frombuffer(data, np.uint8).reshape(self.height, self.width, 3)
         image = Image.fromarray(frame, "RGB")
         self._frame_seq += 1
         return FramePacket(frame_id=self._frame_seq, frame=image)
 
-    def stop(self) -> None:
-        if self.process:
-            try:
-                if self.process.stdout:
-                    self.process.stdout.close()
-            except Exception:
-                pass
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=2.0)
-            except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
-                try:
-                    self.process.wait(timeout=2.0)
-                except Exception:
-                    pass
-            self.process = None
 
-    def restart(self, backoff_s: float = 1.0) -> None:
-        with self._restart_lock:
-            try:
-                self.stop()
-            except Exception:
-                pass
-            if backoff_s > 0:
-                time.sleep(backoff_s)
-            self.start()
-
-
-class RTMPPush:
+class RTMPPush(RTMPBase):
     """通过 ffmpeg 将处理后帧推回 RTMP。"""
 
     def __init__(
@@ -377,132 +415,94 @@ class RTMPPush:
         height: int,
         keep_audio: bool = False,
         audio_source_url: Optional[str] = None,
+        add_timestamp: bool = False,
+        trace: bool = False
     ):
+        super().__init__()
         self.rtmp_url = rtmp_url
         self.fps = fps
         self.width = width
         self.height = height
         self.keep_audio = keep_audio
         self.audio_source_url = audio_source_url
-        self.process: Optional[subprocess.Popen] = None
-        self._log_thread: Optional[threading.Thread] = None
-        self._restart_lock = threading.Lock()
+        self.process = None
+        self._log_thread = None
+        self.add_timestamp = add_timestamp
+        self.trace = trace
 
     def start(self) -> None:
         print(f"[RTMPPush] Pushing to {self.rtmp_url}")
         gop = max(int(self.fps), 1)
+        use_audio = self.keep_audio and self.audio_source_url
 
-        if self.keep_audio and self.audio_source_url:
-            cmd = [
+        cmd = [
                 "ffmpeg",
-                "-loglevel",
-                "error",
+                "-loglevel", "error",
                 "-nostats",
-                "-f",
-                "rawvideo",
-                "-pixel_format",
-                "rgb24",
-                "-video_size",
-                f"{self.width}x{self.height}",
-                "-framerate",
-                str(self.fps),
-                "-i",
-                "pipe:",
-                "-i",
-                self.audio_source_url,
-                "-map",
-                "0:v",
-                "-map",
-                "1:a",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-g",
-                str(gop),
-                "-keyint_min",
-                str(gop),
-                "-sc_threshold",
-                "0",
-                "-bf",
-                "0",
-                "-pix_fmt",
-                "yuv420p",
-                "-b:v",
-                "6000k",
-                "-maxrate",
-                "6000k",
-                "-bufsize",
-                "3000k",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
+                "-f", "rawvideo",
+                "-pixel_format", "rgb24",
+                "-video_size", f"{self.width}x{self.height}",
+                "-framerate", str(self.fps),
+                "-i", "pipe:",
+        ]
+        if self.add_timestamp:
+            opt = " ".join([
+                'drawtext=fontfile=DejaVuSans-Bold.ttf:',
+                r"text='%{pts\:hms}':",
+                "x=(w-tw): y=h-(2*lh):",
+                "fontcolor=yellow:",
+                "fontsize=90:",
+                "box=1:",
+                'boxcolor=0x00000000@0.5'
+            ])
+            cmd.extend([
+                "-vf", opt
+            ])
+        if use_audio:
+            cmd.extend([
+                "-i", self.audio_source_url,
+                "-map", "0:v",
+                "-map", "1:a",
+            ])
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-g", str(gop),
+            "-keyint_min", str(gop),
+            "-sc_threshold", "0",
+            "-bf", "0",
+            "-pix_fmt", "yuv420p",
+            "-b:v", "6000k",
+            "-maxrate", "6000k",
+            "-bufsize", "3000k",
+        ])
+        if use_audio:
+            cmd.extend([
+                "-c:a", "aac",
+                "-b:a", "192k",
                 "-shortest",
-                "-flvflags",
-                "no_duration_filesize",
-                "-flush_packets",
-                "1",
-                "-f",
-                "flv",
-                self.rtmp_url,
-            ]
-        else:
-            cmd = [
-                "ffmpeg",
-                "-loglevel",
-                "error",
-                "-nostats",
-                "-f",
-                "rawvideo",
-                "-pixel_format",
-                "rgb24",
-                "-video_size",
-                f"{self.width}x{self.height}",
-                "-framerate",
-                str(self.fps),
-                "-i",
-                "pipe:",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-g",
-                str(gop),
-                "-keyint_min",
-                str(gop),
-                "-sc_threshold",
-                "0",
-                "-bf",
-                "0",
-                "-pix_fmt",
-                "yuv420p",
-                "-b:v",
-                "6000k",
-                "-maxrate",
-                "6000k",
-                "-bufsize",
-                "3000k",
-                "-flvflags",
-                "no_duration_filesize",
-                "-flush_packets",
-                "1",
-                "-f",
-                "flv",
-                self.rtmp_url,
-            ]
+            ])
+        cmd.extend([
+            "-flush_packets", "1",
+            "-f", "flv",
+            "-y",
+            self.rtmp_url,
+        ])
 
+        # FIXME: can we check that the pipe doesn't get full and stalls?
+        env = os.environ
+        if self.trace:
+            env['FFREPORT'] = 'file=ffmpeg_out_trace.log:level=56'
         self.process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=10 * self.width * self.height * 3,
+            env=env
         )
+        self.stream = self.process.stdin
 
         def _log_ffmpeg() -> None:
             proc = self.process
@@ -515,108 +515,74 @@ class RTMPPush:
                     msg = line.decode(errors="ignore").strip()
                     if msg:
                         print(f"[RTMPPush ffmpeg] {msg}")
-            except Exception:
+            except Exception as exc:
+                print("[RTMPPush ffmpeg] Unable to log ffmpeg errors:", exc)
                 pass
 
         self._log_thread = threading.Thread(target=_log_ffmpeg, daemon=True)
         self._log_thread.start()
         print("[RTMPPush] Started")
 
-    def is_alive(self) -> bool:
-        return bool(
-            self.process is not None
-            and self.process.poll() is None
-            and self.process.stdin is not None
-        )
-
-    def restart(self, backoff_s: float = 1.0) -> None:
-        with self._restart_lock:
-            try:
-                self.stop()
-            except Exception:
-                pass
-            if backoff_s > 0:
-                time.sleep(backoff_s)
-            self.start()
-
     def write_frame(self, frame: OutputFrame) -> bool:
-        if not self.process or not self.process.stdin:
-            return False
-        if self.process.poll() is not None:
+        if not self.is_alive():
             return False
 
+        if isinstance(frame, Image.Image):
+            frame = frame.convert("RGB")
+        arr = np.asarray(frame, dtype=np.uint8)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(f"Unexpected frame shape: {arr.shape}")
+        self.process.stdin.write(np.ascontiguousarray(arr).tobytes())
+        return True
+
+
+def restart_capture(capture, restarts=5):
+    for _ in range(restarts):
         try:
-            if isinstance(frame, Image.Image):
-                arr = np.asarray(frame.convert("RGB"), dtype=np.uint8)
-            else:
-                arr = np.asarray(frame, dtype=np.uint8)
-                if arr.ndim != 3 or arr.shape[2] != 3:
-                    raise ValueError(f"Unexpected frame shape: {arr.shape}")
-            self.process.stdin.write(np.ascontiguousarray(arr).tobytes())
-            return True
+            capture._partial_frame_buf.clear()
+            capture.restart(backoff_s=1.0)
         except Exception as exc:
-            print(f"[RTMPPush] write_frame error: {exc}")
-            return False
-
-    def stop(self) -> None:
-        if self.process:
-            try:
-                if self.process.stdin:
-                    self.process.stdin.close()
-            except Exception:
-                pass
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=2.0)
-            except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
-                try:
-                    self.process.wait(timeout=2.0)
-                except Exception:
-                    pass
-            self.process = None
+            print("[CaptureThread] Restart failed:", exc)
+            time.sleep(0.1)
+        else:
+            return True
+    return False
 
 
 def capture_thread(capture: RTMPCapture, buffer: StreamBuffer) -> None:
-    try:
-        consecutive_none = 0
-        while True:
-            packet = capture.read_frame()
-            if packet is None:
-                consecutive_none += 1
-                if consecutive_none >= 5:
-                    consecutive_none = 0
-                    print("[CaptureThread] Restarting capture")
-                    try:
-                        capture._partial_frame_buf.clear()
-                        capture.restart(backoff_s=1.0)
-                    except Exception as exc:
-                        print(f"[CaptureThread] Restart failed: {exc}")
-                        time.sleep(2.0)
-                else:
-                    time.sleep(0.05)
-                continue
+    consecutive_none = 0
+    counter = 0
+    timer = time.perf_counter()
+    while True:
+        packet = capture.read_frame()
+        if packet is None:
+            consecutive_none += 1
+            if consecutive_none >= 5:
+                print("[CaptureThread] Restarting capture")
+                success = restart_capture(capture)
+                if not success:
+                    print("[CaptureThread] Unable to restart. Stopping thread")
+                    break
+                consecutive_none = 0
+            else:
+                time.sleep(1)
+            continue
 
-            consecutive_none = 0
-            buffer.put(packet)
+        consecutive_none = 0
+        buffer.put(packet)
+        counter += 1
+        if counter % CAPTURE_LOG_INTERVAL == 0:
+            printlog(1, "[CaptureThread] ({}) Captured {} frames in {:.3f} s. Total {} frames".format(
+                timestamp(), CAPTURE_LOG_INTERVAL, time.perf_counter() - timer, counter))
+            timer = time.perf_counter()
+
+
+def capture_thread_safe(*args):
+    "Safe version of capture_thread that prints exceptions"
+    try:
+        capture_thread(*args)
     except Exception as exc:
         print(f"[CaptureThread] Error: {exc}")
-
-
-def _cuda_set_device_for_thread(device: str) -> None:
-    if device == "cpu":
-        return
-    if device == "cuda":
-        torch.cuda.set_device(0)
-        return
-    if device.startswith("cuda:"):
-        try:
-            torch.cuda.set_device(int(device.split(":")[-1]))
-        except Exception:
-            torch.cuda.set_device(0)
 
 
 def process_thread(
@@ -624,182 +590,101 @@ def process_thread(
     buffer: StreamBuffer,
     output_queue: "queue.Queue[FramePacket]",
     batch_size: int,
-    bootstrap_batch_size: Optional[int] = None,
-    dyn_wait_s: float = 0.9,
 ) -> None:
-    try:
-        _cuda_set_device_for_thread(flashvsr.device)
-
-        first = True
-        bs0 = int(bootstrap_batch_size) if bootstrap_batch_size is not None else int(batch_size)
-        bs0 = max(5, bs0)
-        dyn_last_no_batch_ts = time.monotonic()
-
-        dummy = [
-            Image.new("RGB", (flashvsr.in_w, flashvsr.in_h), (0, 0, 0))
-            for _ in range(bs0)
-        ]
-        print(
-            f"[ProcessThread] Warmup on inference thread "
-            f"({len(dummy)} frames, matches first batch shape)"
-        )
-        _ = flashvsr.process_batch(dummy)
-        if flashvsr.device != "cpu":
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-        print("[ProcessThread] Inference-thread warmup finished")
-
-        while True:
-            cur_bs = bs0 if first else int(batch_size)
-            batch_packets = buffer.get_batch(cur_bs)
-
-            if batch_packets is not None:
-                batch = [packet.frame for packet in batch_packets]
-                out_frames = flashvsr.process_batch(batch)
-                output_count = len(out_frames)
-
-                for idx, out_frame in enumerate(out_frames):
-                    src_packet = batch_packets[min(idx, len(batch_packets) - 1)]
-                    out_packet = FramePacket(frame_id=src_packet.frame_id, frame=out_frame)
-                    try:
-                        output_queue.put_nowait(out_packet)
-                    except queue.Full:
-                        try:
-                            _ = output_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            output_queue.put_nowait(out_packet)
-                        except queue.Full:
-                            pass
-
-                if first:
-                    print(
-                        f"[ProcessThread] First batch done: "
-                        f"input={len(batch_packets)} output={output_count}"
-                    )
-                first = False
-                dyn_last_no_batch_ts = time.monotonic()
-                continue
-
-            now = time.monotonic()
-            if now - dyn_last_no_batch_ts >= dyn_wait_s:
-                avail = buffer.size()
-                if avail >= 5:
-                    dyn_bs = avail - ((avail - 1) % 4)
-                    dyn_bs = max(5, dyn_bs)
-                    dyn_batch = buffer.get_batch(dyn_bs)
-                    if dyn_batch is not None:
-                        out_frames = flashvsr.process_batch([packet.frame for packet in dyn_batch])
-                        for idx, out_frame in enumerate(out_frames):
-                            src_packet = dyn_batch[min(idx, len(dyn_batch) - 1)]
-                            out_packet = FramePacket(frame_id=src_packet.frame_id, frame=out_frame)
-                            try:
-                                output_queue.put_nowait(out_packet)
-                            except queue.Full:
-                                try:
-                                    _ = output_queue.get_nowait()
-                                except queue.Empty:
-                                    pass
-                                try:
-                                    output_queue.put_nowait(out_packet)
-                                except queue.Full:
-                                    pass
-                        dyn_last_no_batch_ts = time.monotonic()
-                        continue
-
-                if 0 < avail < 5:
-                    dyn_batch = buffer.get_batch(avail)
-                    if dyn_batch:
-                        while len(dyn_batch) < 5:
-                            dyn_batch.append(dyn_batch[-1])
-                        out_frames = flashvsr.process_batch([packet.frame for packet in dyn_batch])
-                        for idx, out_frame in enumerate(out_frames):
-                            src_packet = dyn_batch[min(idx, len(dyn_batch) - 1)]
-                            out_packet = FramePacket(frame_id=src_packet.frame_id, frame=out_frame)
-                            try:
-                                output_queue.put_nowait(out_packet)
-                            except queue.Full:
-                                try:
-                                    _ = output_queue.get_nowait()
-                                except queue.Empty:
-                                    pass
-                                try:
-                                    output_queue.put_nowait(out_packet)
-                                except queue.Full:
-                                    pass
-                        dyn_last_no_batch_ts = time.monotonic()
-                        continue
-
+    timer = time.perf_counter()
+    counter = 0
+    while True:
+        batch_packets = buffer.get_batch(batch_size)
+        if batch_packets is None:
             time.sleep(0.05)
+            continue
+
+        batch = [packet.frame for packet in batch_packets]
+        out_frames = flashvsr.process_batch(batch)
+
+        for idx, out_frame in enumerate(out_frames):
+            src_packet = batch_packets[min(idx, len(batch_packets) - 1)]
+            out_packet = FramePacket(frame_id=src_packet.frame_id, frame=out_frame)
+            try:
+                output_queue.put_nowait(out_packet)
+            except queue.Full:
+                print("[ProcessThread] Error: output queue full")
+
+        if len(batch_packets) != len(out_frames):
+            print("[ProcessThread] Error: Input/output frame mismatch")
+
+        counter += len(out_frames)
+        printlog(1, "[ProcessThread] ({}) Processed {}/{} frames in {:.3f} s. Total {} frames".format(
+            timestamp(), len(batch_packets), len(out_frames), time.perf_counter() - timer, counter))
+        timer = time.perf_counter()
+
+def process_thread_safe(*args):
+    "Safe version of process_thread that prints exceptions"
+    try:
+        process_thread(*args)
     except Exception as exc:
         print(f"[ProcessThread] Error: {exc}")
 
 
+def restart_pusher(pusher, restarts=5):
+    for _ in range(restarts):
+        try:
+            pusher.restart(backoff_s=1.0)
+        except Exception as exc:
+            print(f"[PushThread] Restart failed: {exc}")
+            time.sleep(1.0)
+        else:
+            return True
+    return False
+
+
 def push_thread(pusher: RTMPPush, output_queue: "queue.Queue[FramePacket]") -> None:
-    last_packet: Optional[FramePacket] = None
+    last_packet = None
     pushed = 0
-    pusher_started = False
+    timer = time.perf_counter()
+    frame_interval = 1.0 / max(float(pusher.fps), 1e-6)
 
+    print("[PushThread] Waiting for first output frame")
     try:
-        frame_interval = 1.0 / max(float(pusher.fps), 1e-6)
-        next_t = time.monotonic()
-        print("[PushThread] Waiting for first output frame")
+        pusher.start()
+    except Exception as exc:
+        print(f"[PushThread] Initial start failed: {exc}")
 
-        while True:
-            if not pusher_started:
-                try:
-                    packet = output_queue.get(timeout=0.5)
-                    last_packet = packet
-                except queue.Empty:
-                    continue
-                try:
-                    pusher.start()
-                    pusher_started = True
-                except Exception as exc:
-                    print(f"[PushThread] Initial start failed: {exc}")
-                    time.sleep(1.0)
-                    continue
-                next_t = time.monotonic()
-            else:
-                if not pusher.is_alive():
-                    print("[PushThread] Restarting pusher")
-                    try:
-                        pusher.restart(backoff_s=1.0)
-                    except Exception as exc:
-                        print(f"[PushThread] Restart failed: {exc}")
-                        time.sleep(1.0)
-                        next_t = time.monotonic()
-                        continue
+    while True:
+        next_t = time.monotonic() + frame_interval
+        if not pusher.is_alive():
+            print("[PushThread] Restarting pusher")
+            success = restart_pusher(pusher)
+            if not success:
+                print("[PushThread] Unable to restart. Stopping thread")
+                break
+        try:
+            last_packet = output_queue.get_nowait()
+        except queue.Empty:
+            # print("[PushThread] Empty output queue")
+            time.sleep(EMPTY_OUT_QUEUE_WAIT_S)
+            continue
 
-                try:
-                    last_packet = output_queue.get_nowait()
-                except queue.Empty:
-                    if last_packet is None:
-                        time.sleep(0.01)
-                        continue
+        try:
+            success = pusher.write_frame(last_packet.frame)
+        except Exception as exc:
+            print("[PushThread] Error while writing frame:", exc)
+            continue
 
-            assert last_packet is not None
-            if not pusher.write_frame(last_packet.frame):
-                print("[PushThread] write_frame failed, restarting pusher")
-                try:
-                    pusher.restart(backoff_s=1.0)
-                except Exception as exc:
-                    print(f"[PushThread] Restart failed: {exc}")
-                    time.sleep(1.0)
-                next_t = time.monotonic()
-                continue
+        pushed += 1
+        if pushed % PUSH_LOG_INTERVAL == 0:
+            printlog(1, "[PushThread] ({}) Pushed {} frames in {:.3f} s. Total {} frames".format(
+                timestamp(), PUSH_LOG_INTERVAL, time.perf_counter() - timer, pushed))
+            timer = time.perf_counter()
 
-            pushed += 1
-            if pushed % 60 == 0:
-                print(f"[PushThread] Pushed {pushed} frames")
+        sleep_s = next_t - time.monotonic()
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
-            next_t += frame_interval
-            sleep_s = next_t - time.monotonic()
-            if sleep_s > 0:
-                time.sleep(sleep_s)
+
+def push_tread_safe(*args):
+    try:
+        push_thread(*args)
     except Exception as exc:
         print(f"[PushThread] Error: {exc}")
 
@@ -812,80 +697,62 @@ def parse_args() -> argparse.Namespace:
         "--input-rtmp",
         type=str,
         default="rtmp://47.79.124.13:30501/live/original_stream",
-        help="输入 RTMP 地址（来自 OBS -> SRS），如 rtmp://127.0.0.1:1935/live/src",
+        help="Input RTMP address (e.g. OBS -> SRS)",
     )
     parser.add_argument(
         "--output-rtmp",
         type=str,
         default="rtmp://47.79.124.13:30501/live/sr_stream",
-        help="输出 RTMP 地址（推回 SRS），如 rtmp://127.0.0.1:1935/live/sr",
+        help="Output RTMP address (e.g. push back to SRS)",
     )
-    parser.add_argument("--input-width", type=int, default=640, help="输入宽度")
-    parser.add_argument("--input-height", type=int, default=360, help="输入高度")
-    parser.add_argument("--fps", type=int, default=10, help="输入/输出帧率")
+    parser.add_argument("--input-width", type=int, default=640, help="Input Width")
+    parser.add_argument("--input-height", type=int, default=360, help="Ouput widht")
+    parser.add_argument("--fps", type=int, default=10, help="Input/output frame rate")
 
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="tiny",
-        choices=["full", "tiny", "tiny-long"],
-        help="FlashVSR 模式",
-    )
-    parser.add_argument("--tile-dit", action="store_true", help="启用 DiT 分块")
-    parser.add_argument("--tile-vae", action="store_true", help="启用 VAE 分块")
-    parser.add_argument("--tile-size", type=int, default=256, help="分块大小")
-    parser.add_argument("--overlap", type=int, default=24, help="分块重叠")
-
-    parser.add_argument("--scale", type=float, default=2.0, help="超分倍率")
-    parser.add_argument("--sparse-ratio", type=float, default=2.0, help="稀疏注意力比例")
-    parser.add_argument("--kv-ratio", type=float, default=3.0, help="KV cache 比例")
-    parser.add_argument("--local-range", type=int, default=11, help="局部注意力范围")
-    parser.add_argument("--seed", type=int, default=0, help="随机种子")
-    parser.add_argument("--device", type=str, default="cuda", help="推理设备")
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="bf16",
-        choices=["fp32", "fp16", "bf16"],
-        help="计算精度",
-    )
-
-    parser.add_argument("--batch-size", type=int, default=25, help="常规 batch 大小")
-    parser.add_argument(
-        "--bootstrap-batch-size",
-        type=int,
-        default=0,
-        help="首批 batch 大小，0 表示与 batch-size 相同",
-    )
-    parser.add_argument("--buffer-size", type=int, default=300, help="输入缓冲大小")
-    parser.add_argument(
-        "--dyn-wait-s",
-        type=float,
-        default=0.9,
-        help="batch 不足时，等待多久后降级为动态 batch",
-    )
-    parser.add_argument("--keep-audio", action="store_true", help="保留原始音频")
-    parser.add_argument(
-        "--lq-bootstrap-windows",
-        type=int,
-        default=7,
-        help="LQ 特征预取窗口数",
-    )
-    parser.add_argument("--color-fix", action="store_true", help="启用颜色校正")
-    parser.add_argument(
-        "--disable-low-latency",
-        action="store_true",
-        help="禁用低延迟常驻 GPU 策略",
-    )
+    parser.add_argument("--mode", type=str, default="tiny",
+                        choices=["full", "tiny", "tiny-long"], help="FlashVSR mode")
+    parser.add_argument("--tile-dit", action="store_true",
+                        help="Enable DiT tiling to reduce memory usage")
+    parser.add_argument("--tile-vae", action="store_true",
+                        help="Enable VAE tiling to reduce memory usage")
+    parser.add_argument("--tile-size", type=int, default=256,
+                        help="Tile size for DiT/VAE tiling")
+    parser.add_argument("--overlap", type=int, default=24,
+                        help="Amount of overlap in DiT/VAE tiling")
+    parser.add_argument("--scale", type=float, default=2.0,
+                        help="Super resolution scaling factor")
+    parser.add_argument("--sparse-ratio", type=float, default=2.0,
+                        help="Sparsity ratio for attention layers")
+    parser.add_argument("--kv-ratio", type=float, default=3.0,
+                        help="KV cache ratio")
+    parser.add_argument("--local-range", type=int, default=11,
+                        help="Local attention range")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="seed for random number generator")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Inference device")
+    parser.add_argument("--dtype", type=str, default="bf16",
+                        choices=["fp32", "fp16", "bf16"], help="Data type")
+    parser.add_argument("--batch-size", type=int, default=24,
+                        help="FlashVSR batch size, in frames. Needs to be multiple of 8.")
+    parser.add_argument("--buffer-size", type=int, default=300,
+                        help="Input buffer size")
+    parser.add_argument("--keep-audio", action="store_true",
+                        help="Retain original audio")
+    parser.add_argument("--color-fix", action="store_true",
+                        help="Enable color correction in FlashVSR")
+    parser.add_argument("--loop", action="store_true", help='Loop input video')
+    parser.add_argument("--itstamp", action="store_true",
+                        help="Add timestamp to output video")
+    parser.add_argument("--otstamp", action="store_true",
+                        help="Add timestamp to output video")
+    parser.add_argument("--otrace", action="store_true",
+                        help="Save trace of output ffmpeg process")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
-    bootstrap_bs = (
-        args.bootstrap_batch_size if args.bootstrap_batch_size > 0 else args.batch_size
-    )
 
     print("=" * 80)
     print("FlashVSR-Pro Livestream Core")
@@ -901,13 +768,15 @@ def main() -> None:
     print("=" * 80)
 
     buffer = StreamBuffer(max_size=args.buffer_size)
-    output_queue: "queue.Queue[FramePacket]" = queue.Queue(maxsize=100)
+    output_queue: "queue.Queue[FramePacket]" = queue.Queue(maxsize=1000)
 
     capture = RTMPCapture(
         args.input_rtmp,
         fps=args.fps,
         width=args.input_width,
         height=args.input_height,
+        loop=args.loop,
+        add_timestamp=args.itstamp
     )
 
     out_w, out_h, _, _ = compute_scaled_and_target_dims(
@@ -920,6 +789,8 @@ def main() -> None:
         height=out_h,
         keep_audio=args.keep_audio,
         audio_source_url=args.input_rtmp if args.keep_audio else None,
+        add_timestamp=args.otstamp,
+        trace=args.otrace
     )
 
     try:
@@ -938,9 +809,7 @@ def main() -> None:
             kv_ratio=args.kv_ratio,
             local_range=args.local_range,
             seed=args.seed,
-            lq_bootstrap_windows=args.lq_bootstrap_windows,
             color_fix=args.color_fix,
-            low_latency=(not args.disable_low_latency),
         )
     except Exception as exc:
         print(f"[Main] Failed to init FlashVSR: {exc}")
@@ -954,14 +823,12 @@ def main() -> None:
 
     t_cap = threading.Thread(target=capture_thread, args=(capture, buffer), daemon=True)
     t_proc = threading.Thread(
-        target=process_thread,
+        target=process_thread_safe,
         args=(
             flashvsr,
             buffer,
             output_queue,
             args.batch_size,
-            args.bootstrap_batch_size if args.bootstrap_batch_size > 0 else None,
-            float(args.dyn_wait_s),
         ),
         daemon=True,
     )
