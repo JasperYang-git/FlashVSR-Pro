@@ -105,14 +105,14 @@ class TorchColorCorrectorWavelet(nn.Module):
     ) -> torch.Tensor:
         # Check basic dimensions
         assert hq_image.dim() == 5 and hq_image.shape[1] == 3, "Input must be (B, 3, f, H, W)"
-        
+
         # Auto-resize lq_image if spatial dimensions mismatch (Robustness Fix)
         if hq_image.shape[-2:] != lq_image.shape[-2:]:
             lq_flat, B_lq, f_lq = self._flatten_time(lq_image)
             lq_flat = F.interpolate(
-                lq_flat, 
-                size=(hq_image.shape[-2], hq_image.shape[-1]), 
-                mode='bilinear', 
+                lq_flat,
+                size=(hq_image.shape[-2], hq_image.shape[-1]),
+                mode='bilinear',
                 align_corners=False
             )
             lq_image = self._unflatten_time(lq_flat, B_lq, f_lq)
@@ -171,6 +171,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         self.use_unified_sequence_parallel = False
         self.prompt_emb_posi = None
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
+        self.rand_generator = None
+        self.emb_count = 0
 
     def enable_vram_management(self, num_persistent_param_in_dit=None):
         # Only manage dit / vae
@@ -207,6 +209,9 @@ class FlashVSRTinyPipeline(BasePipeline):
     def fetch_models(self, model_manager: ModelManager):
         self.dit = model_manager.fetch_model("wan_video_dit")
         self.vae = model_manager.fetch_model("wan_video_vae")
+        self.pre_cache_k = [None] * len(self.dit.blocks)
+        self.pre_cache_v = [None] * len(self.dit.blocks)
+
 
     @staticmethod
     def from_model_manager(model_manager: ModelManager, torch_dtype=None, device=None, use_usp=False):
@@ -301,68 +306,68 @@ class FlashVSRTinyPipeline(BasePipeline):
     def _tiled_decode(self, latents, cond, tile_size, tile_stride, decoding_msg):
         # latents: (B, C, F, H, W)
         # cond: (B, C, F, H_c, W_c)
-        
+
         device = self.device
         dtype = latents.dtype
         B, C, F, H, W = latents.shape
         _, _, _, H_c, W_c = cond.shape
-        
+
         # Determine upscale factor for VAE (Latent -> Output)
         vae_upscale = 8 # WanVideoVAE default
         out_H, out_W = H * vae_upscale, W * vae_upscale
-        
+
         # Determine scale factor for Cond (Latent -> Cond)
         # Assuming cond is 8x latent size (standard for WanVideoVAE 8x downsample)
         # PixelShuffle3d(4, 8, 8) reduces Cond by 8x spatially to match Latent
         cond_scale = 8
-        
+
         # Prepare Output Accumulator
         # Output is [-1, 1] range from TCDecoder, we accumulate directly?
         # We need float32 accumulator for precision
         # TCDecoder temporal upsampling: F_latent -> F_latent * 4 - 3 (typically)
         # We use dimensions from cond (LQ_video) if available, as they should match target output
-        out_F = cond.shape[2] 
+        out_F = cond.shape[2]
         # Fallback if cond not consistent: out_F = F * 4 - 3
-        
+
         value = torch.zeros((B, 3, out_F, out_H, out_W), device="cpu", dtype=torch.float32)
         count = torch.zeros((B, 1, out_F, out_H, out_W), device="cpu", dtype=torch.float32)
-        
+
         # Define Tiles
         # tile_size and tile_stride are in Latent Space
         ts_h, ts_w = tile_size
         st_h, st_w = tile_stride
-        
+
         tasks = []
         for h in range(0, H, st_h):
             if (h-st_h >= 0 and h-st_h+ts_h >= H): continue
             for w in range(0, W, st_w):
                 if (w-st_w >= 0 and w-st_w+ts_w >= W): continue
                 tasks.append((h, w))
-        
+
         if not decoding_msg:
              decoding_msg = "Decoding video (Tiled)"
-             
+
         for (h, w) in tqdm(tasks, desc=decoding_msg):
             self.TCDecoder.clean_mem()
-            
+
             # Tile coordinates in Latent Space
             h_end = min(h + ts_h, H)
             w_end = min(w + ts_w, W)
-            
+
             # 1. Crop Latents
             lat_tile = latents[:, :, :, h:h_end, w:w_end].to(device)
-            
+
             # 2. Crop Cond
             # Calculate cond coordinates
             hc, wc = h * cond_scale, w * cond_scale
             hc_end, wc_end = h_end * cond_scale, w_end * cond_scale
-            
+
             # Ensure cond crop is within bounds (though it should be if ratio is correct)
             hc_end = min(hc_end, H_c)
             wc_end = min(wc_end, W_c)
-            
+
             cond_tile = cond[:, :, :, hc:hc_end, wc:wc_end].to(device)
-            
+
             # 3. Decode
             # TCDecoder.decode_video expects latents (B, F, C, H, W)
             frames_tile = self.TCDecoder.decode_video(
@@ -371,8 +376,8 @@ class FlashVSRTinyPipeline(BasePipeline):
                 show_progress_bar=False,
                 cond=cond_tile,
                 decoding_msg=None
-            ) # returns (B, F, C, H, W) in [0, 1] usually? 
-            # Wait, standard TCDecoder returns [0, 1]? 
+            ) # returns (B, F, C, H, W) in [0, 1] usually?
+            # Wait, standard TCDecoder returns [0, 1]?
             # TCDecoder `decode_video` output:
             # "returns NTCHW RGB in ~[0, 1]"
             # BUT in `__call__` originally: `... .transpose(1, 2).mul_(2).sub_(1)`
@@ -384,23 +389,23 @@ class FlashVSRTinyPipeline(BasePipeline):
             # Typically DiffSynth pipelines return [-1, 1] tensors?
             # Or [0, 1]?
             # ColorCorrector input `lq_image`?
-            
+
             # Let's match existing `__call__` logic.
             # Existing: `frames = self.TCDecoder.decode_video(...).transpose(1, 2).mul_(2).sub_(1)`
             # So `decode_video` returns [0, 1]. `frames` becomes [-1, 1].
             # Then ColorCorrector is applied.
-            
+
             # So here: frames_tile is [0, 1], (B, F, 3, H, W).
             # Convert to [-1, 1] and (B, 3, F, H, W).
             frames_tile = frames_tile.transpose(1, 2).mul_(2.0).sub_(1.0)
-            
+
             # Ensure time dimension matches accumulator (trim if necessary)
             if frames_tile.shape[2] > out_F:
                 frames_tile = frames_tile[:, :, :out_F, :, :]
-            
+
             # Move to CPU for accumulation
             frames_tile = frames_tile.to("cpu")
-            
+
             # 4. Mask
             # Using self.vae.build_mask logic
             # build_mask expects (..., H, W)
@@ -408,22 +413,26 @@ class FlashVSRTinyPipeline(BasePipeline):
             # Latent border was (ts_h - st_h). Output border is * vae_upscale.
             border_h = (ts_h - st_h) * vae_upscale
             border_w = (ts_w - st_w) * vae_upscale
-            
+
             mask = self._build_mask(
                 frames_tile,
                 is_bound=(h==0, h+ts_h>=H, w==0, w+ts_w>=W),
                 border_width=(border_h, border_w)
             ).to(dtype=frames_tile.dtype, device="cpu")
-            
+
             # 5. Accumulate
             oh, ow = h * vae_upscale, w * vae_upscale
             oh_end = oh + frames_tile.shape[3]
             ow_end = ow + frames_tile.shape[4]
-            
+
             value[:, :, :, oh:oh_end, ow:ow_end] += frames_tile * mask
             count[:, :, :, oh:oh_end, ow:ow_end] += mask
-            
+
         return value / count
+
+    # Redefine generate_noise to use generator attribute
+    def generate_noise(self, shape, device="cpu", dtype=torch.float16):
+        return torch.randn(shape, generator=self.rand_generator, device=device, dtype=dtype)
 
     @torch.no_grad()
     def __call__(
@@ -453,7 +462,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         local_range = 9,
         color_fix = True,
         decoding_msg = None,
-        lq_bootstrap_windows: int = 7,
+        streaming=False
     ):
         # Only accept cfg=1.0 (Consistent with original code)
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -467,104 +476,57 @@ class FlashVSRTinyPipeline(BasePipeline):
                 "    pipe.init_cross_kv(context_tensor=your_context_tensor)"
             )
 
+        if self.rand_generator is None and seed is not None:
+            self.rand_generator = torch.Generator(self.device).manual_seed(seed)
+
         # Dimension Correction
         height, width = self.check_resize_height_width(height, width)
-        if num_frames % 4 != 1:
-            num_frames = (num_frames + 2) // 4 * 4 + 1
-            print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
 
         # Tiler Parameters
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
 
         # Initialize Noise
-        if if_buffer:
-            noise = self.generate_noise((1, 16, (num_frames - 1) // 4, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
-        else:
-            noise = self.generate_noise((1, 16, (num_frames - 1) // 4 + 1, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
-        # noise = noise.to(dtype=self.torch_dtype, device=self.device)
-        latents = noise
+        latent_shape = (1, 16, num_frames//4, height//8, width//8)
+        latents = self.generate_noise(latent_shape, device=self.device, dtype=self.torch_dtype)
 
-        # Streaming path needs at least 6 latent frames for the first step:
-        # WanVideoDiT.SelfAttention enforces f==6 when starting a new stream block (no KV cache yet).
-        # For short clips with if_buffer=True, (num_frames-1)//4 can be < 6 (e.g. 17 frames -> 4),
-        # so we pad the latent time dimension by repeating the last frame.
-        if latents.shape[2] < 6:
-            pad = 6 - latents.shape[2]
-            latents = torch.cat([latents, latents[:, :, -1:, :, :].repeat(1, 1, pad, 1, 1)], dim=2)
-
-        # For short clips / realtime batches (e.g., 9/17 frames), the original formula becomes <= 0,
-        # which would skip inference entirely. We guarantee at least one process step.
-        process_total_num = max(1, (num_frames - 1) // 8 - 2)
+        process_total_num = num_frames // 8
         is_stream = True
 
         # Clear potential LQ_proj_in cache
-        if hasattr(self.dit, "LQ_proj_in"):
-            self.dit.LQ_proj_in.clear_cache()
-
+        if not streaming:
+            if hasattr(self.dit, "LQ_proj_in"):
+                self.dit.LQ_proj_in.clear_cache()
+            self.TCDecoder.clean_mem()
         latents_total = []
-        self.TCDecoder.clean_mem()
-        LQ_pre_idx = 0
+
         LQ_cur_idx = 0
 
+        procgen = range(process_total_num)
+        if not streaming:
+            procgen = tqdm(procgen, desc="DiT Inference")
         with torch.no_grad():
-            for cur_process_idx in tqdm(range(process_total_num), desc="DiT Inference"):
-                if cur_process_idx == 0:
-                    pre_cache_k = [None] * len(self.dit.blocks)
-                    pre_cache_v = [None] * len(self.dit.blocks)
-                    LQ_latents = None
-                    # Original code used 7 windows, which assumes 25 LQ frames are available:
-                    # end index sequence: 1, 5, 9, 13, 17, 21, 25
-                    # For realtime, allow fewer windows to reduce first-batch spike and to support
-                    # batch-size < 25. We also cap by what current num_frames can cover.
-                    max_windows_by_frames = (max(num_frames, 1) + 2) // 4 + 1
-                    inner_loop_num = max(1, min(int(lq_bootstrap_windows), int(max_windows_by_frames)))
-                    for inner_idx in range(inner_loop_num):
-                        cur = self.denoising_model().LQ_proj_in.stream_forward(
-                            LQ_video[:, :, max(0, inner_idx * 4 - 3):(inner_idx + 1) * 4 - 3, :, :]
-                        ) if LQ_video is not None else None
-                        if cur is None:
-                            continue
-                        if LQ_latents is None:
-                            LQ_latents = cur
-                        else:
-                            for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat(
-                                    [LQ_latents[layer_idx], cur[layer_idx]], dim=1
-                                )
-                    # Keep original behavior for the default long-clip case (25 frames, 7 windows),
-                    # but for reduced-window / short batches, advance LQ_cur_idx to the covered end.
-                    if inner_loop_num == 7 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7:
-                        LQ_cur_idx = (inner_loop_num - 1) * 4 - 3  # legacy: 21
+            for cur_process_idx in procgen:
+                LQ_latents = None
+                inner_loop_num = 2
+                for inner_idx in range(inner_loop_num):
+                    start = cur_process_idx * 8 + inner_idx * 4
+                    cur = self.denoising_model().LQ_proj_in.stream_forward(
+                        LQ_video[:, :, start:start + 4, :,:]
+                    ) if LQ_video is not None else None
+                    if cur is None:
+                        continue
+                    if LQ_latents is None:
+                        LQ_latents = cur
                     else:
-                        LQ_cur_idx = min(num_frames, inner_loop_num * 4 - 3)
-                    cur_latents = latents[:, :, :6, :, :]
-                else:
-                    LQ_latents = None
-                    inner_loop_num = 2
-                    for inner_idx in range(inner_loop_num):
-                        cur = self.denoising_model().LQ_proj_in.stream_forward(
-                            LQ_video[
-                                :,
-                                :,
-                                cur_process_idx * 8 + 17 + inner_idx * 4:cur_process_idx * 8 + 21 + inner_idx * 4,
-                                :,
-                                :,
-                            ]
-                        ) if LQ_video is not None else None
-                        if cur is None:
-                            continue
-                        if LQ_latents is None:
-                            LQ_latents = cur
-                        else:
-                            for layer_idx in range(len(LQ_latents)):
-                                LQ_latents[layer_idx] = torch.cat(
-                                    [LQ_latents[layer_idx], cur[layer_idx]], dim=1
-                                )
-                    LQ_cur_idx = cur_process_idx * 8 + 21 + (inner_loop_num - 2) * 4
-                    cur_latents = latents[:, :, 4 + cur_process_idx * 2:6 + cur_process_idx * 2, :, :]
+                        for layer_idx in range(len(LQ_latents)):
+                            LQ_latents[layer_idx] = torch.cat(
+                                [LQ_latents[layer_idx], cur[layer_idx]], dim=1
+                            )
+                start = cur_process_idx * 2
+                cur_latents = latents[:, :, start:start + 2, :, :]
 
                 # Inference (No motion_controller / vace)
-                noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
+                noise_pred_posi, self.pre_cache_k, self.pre_cache_v, self.emb_count = model_fn_wan_video(
                     self.dit,
                     x=cur_latents,
                     timestep=self.timestep,
@@ -574,11 +536,11 @@ class FlashVSRTinyPipeline(BasePipeline):
                     LQ_latents=LQ_latents,
                     is_full_block=is_full_block,
                     is_stream=is_stream,
-                    pre_cache_k=pre_cache_k,
-                    pre_cache_v=pre_cache_v,
+                    pre_cache_k=self.pre_cache_k,
+                    pre_cache_v=self.pre_cache_v,
                     topk_ratio=topk_ratio,
                     kv_ratio=kv_ratio,
-                    cur_process_idx=cur_process_idx,
+                    cur_process_idx=self.emb_count,
                     t_mod=self.t_mod,
                     t=self.t,
                     local_range=local_range,
@@ -587,20 +549,10 @@ class FlashVSRTinyPipeline(BasePipeline):
                 # Update latent
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
-                LQ_pre_idx = LQ_cur_idx
 
             latents = torch.cat(latents_total, dim=2)
-
-            # Decode: for very short / reduced-bootstrap streams, disable cond to avoid
-            # temporal/channel mismatches inside TCDecoder when latent time has been padded.
-            use_cond_for_decode = (
-                LQ_cur_idx >= 25 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7
-            )
-            cond_for_decode = (
-                LQ_video[:, :, :LQ_cur_idx, :, :]
-                if (LQ_video is not None and use_cond_for_decode)
-                else None
-            )
+            LQ_cur_idx = (cur_process_idx + 1) * 8
+            cond_for_decode = LQ_video[:, :, :LQ_cur_idx, :, :]
 
             if tiled:
                 frames = self._tiled_decode(
@@ -614,7 +566,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                 frames = self.TCDecoder.decode_video(
                     latents.transpose(1, 2),
                     parallel=False,
-                    show_progress_bar=True,
+                    show_progress_bar=not streaming,
                     cond=cond_for_decode,
                     decoding_msg=decoding_msg if decoding_msg else "Decoding video",
                 ).transpose(1, 2).mul_(2).sub_(1)
@@ -689,18 +641,11 @@ def model_fn_wan_video(
     kv_len = int(kv_ratio)
 
     # RoPE Position (Segmented)
-    if cur_process_idx == 0:
-        freqs = torch.cat([
-            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-    else:
-        freqs = torch.cat([
-            dit.freqs[0][4 + cur_process_idx*2:4 + cur_process_idx*2 + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    freqs = torch.cat([
+        dit.freqs[0][cur_process_idx:cur_process_idx + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
     # Unified Sequence Parallel (Default OFF)
     if use_unified_sequence_parallel:
@@ -715,26 +660,6 @@ def model_fn_wan_video(
     for block_id, block in enumerate(dit.blocks):
         if LQ_latents is not None and block_id < len(LQ_latents):
             lq = LQ_latents[block_id]
-            # Robustness for short / padded streams:
-            # LQ_proj_in.stream_forward emits one latent-time slice per call (first call returns None),
-            # so with reduced bootstrap windows, lq token length can be smaller than current x.
-            # We pad by repeating the last time-slice worth of tokens so shapes match.
-            if lq is not None and lq.shape[1] != x.shape[1]:
-                if lq.shape[1] > x.shape[1]:
-                    lq = lq[:, :x.shape[1], :]
-                else:
-                    # tokens per latent frame at current resolution
-                    tokens_per_f = x.shape[1] // f
-                    if tokens_per_f > 0 and lq.shape[1] >= tokens_per_f:
-                        need = x.shape[1] - lq.shape[1]
-                        reps = (need + tokens_per_f - 1) // tokens_per_f
-                        pad_chunk = lq[:, -tokens_per_f:, :].repeat(1, reps, 1)[:, :need, :]
-                        lq = torch.cat([lq, pad_chunk], dim=1)
-                    else:
-                        # Fallback: repeat last token if shape is unexpectedly small
-                        need = x.shape[1] - lq.shape[1]
-                        lq = torch.cat([lq, lq[:, -1:, :].repeat(1, need, 1)], dim=1)
-                LQ_latents[block_id] = lq
             x = x + LQ_latents[block_id]
         x, last_pre_cache_k, last_pre_cache_v = block(
             x, context, t_mod, freqs, f, h, w,
@@ -757,4 +682,6 @@ def model_fn_wan_video(
         if dist.is_initialized() and dist.get_world_size() > 1:
             x = get_sp_group().all_gather(x, dim=1)
     x = dit.unpatchify(x, (f, h, w))
-    return x, pre_cache_k, pre_cache_v
+    # FIXME: this will create issues with too long videos
+    cpi_next = cur_process_idx + f
+    return x, pre_cache_k, pre_cache_v, cpi_next

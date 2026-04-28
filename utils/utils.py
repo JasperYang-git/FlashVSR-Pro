@@ -263,3 +263,34 @@ class Causal_LQ4x_Proj(nn.Module):
                 outputs.append(self.linear_layers[i](out_x))
             self.clip_idx += 1
             return outputs
+            
+class Causal_LQ4x_Proj_simple(Causal_LQ4x_Proj):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def stream_forward(self, video_clip):
+        x = self.pixel_shuffle(video_clip)
+        next_cache1_x = x[:, :, -CACHE_T:, :, :].clone()
+        cur_cache1 = self.ensure_cache(self.cache['conv1'], x)
+        x = self.conv1(x, cur_cache1)
+        self.cache['conv1'] = next_cache1_x
+        x = self.norm1(x)
+        x = self.act1(x)
+        next_cache2_x = x[:, :, -CACHE_T:, :, :].clone()
+        cur_cache2 = self.ensure_cache(self.cache['conv2'], x)
+        x = self.conv2(x, cur_cache2)
+        self.cache['conv2'] = next_cache2_x
+        x = self.norm2(x)
+        x = self.act2(x)
+        out_x = rearrange(x, 'b c f h w -> b (f h w) c')
+        outputs = []
+        for i in range(self.layer_num):
+            outputs.append(self.linear_layers[i](out_x))
+        self.clip_idx += 1
+        return outputs
+
+    def ensure_cache(self, c, x):
+        'If needed, initialize cache with zeros of proper size.'
+        if c is not None:
+            return c
+        return x[:, :, [0], :, :].repeat(1, 1, CACHE_T, 1, 1)

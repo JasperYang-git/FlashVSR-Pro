@@ -345,8 +345,10 @@ class SelfAttention(nn.Module):
         B, L, D = x.shape
         if is_stream and pre_cache_k is not None and pre_cache_v is not None:
             assert f==2, "f must be 2"
-        if is_stream and (pre_cache_k is None or pre_cache_v is None):
-            assert f==6, " start f must be 6"
+        # RFL: is it safe to remove this check and let the caches be initialized from 2 frames only?
+        # There doesn't seem to be anything special happening when f==6
+        # if is_stream and (pre_cache_k is None or pre_cache_v is None):
+        #     assert f==6, " start f must be 6"
         assert L == f * h * w, "Sequence length mismatch with provided (f,h,w)."
 
         q = self.norm_q(self.q(x))

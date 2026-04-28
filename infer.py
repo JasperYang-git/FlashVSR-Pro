@@ -25,6 +25,7 @@ sys.path.append(current_dir)
 
 from diffsynth import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
 from utils.utils import Causal_LQ4x_Proj
+from utils.utils import Causal_LQ4x_Proj_simple as Causal_LQ4x_Proj
 from utils.TCDecoder import build_tcdecoder
 from utils import vae_manager
 
